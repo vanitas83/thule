@@ -1,0 +1,2 @@
+Perform a deep security and bug audit of the workspace or target: $ARGUMENTS
+Read all relevant files first, save a structured review artifact via `create_artifact`, and list concrete fixes with file paths and line numbers.

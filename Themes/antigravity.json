@@ -1,0 +1,24 @@
+{
+  "name": "antigravity",
+  "accent": "#6195f5",
+  "user": "#6195f5",
+  "ok": "#6cc070",
+  "warn": "#e5b84b",
+  "err": "#f87171",
+  "grad_start": "#6195f5",
+  "grad_end": "#b97cf3",
+  "layout": {
+    "header_style": "antigravity",
+    "header_align": "left",
+    "header_rule": "line",
+    "tab_separator": " \u00b7 ",
+    "meta_position": "below",
+    "chat_style": "cli",
+    "split_mode": "vertical",
+    "split_ratio": 0.28,
+    "panel_box": "none",
+    "prompt_prefix": "> ",
+    "prompt_rule": "line",
+    "compact_logo": true
+  }
+}

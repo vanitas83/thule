@@ -1,0 +1,10 @@
+{
+  "name": "emerald",
+  "accent": "#10b981",
+  "user": "#34d399",
+  "ok": "#22c55e",
+  "warn": "#f59e0b",
+  "err": "#ef4444",
+  "grad_start": "#10b981",
+  "grad_end": "#06b6d4"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "ruby",
+  "accent": "#e11d48",
+  "user": "#fb7185",
+  "ok": "#22c55e",
+  "warn": "#f59e0b",
+  "err": "#f43f5e",
+  "grad_start": "#f43f5e",
+  "grad_end": "#9f1239"
+}

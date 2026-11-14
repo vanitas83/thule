@@ -1,0 +1,14 @@
+{
+  "name": "coder",
+  "description": "Writes and modifies code cleanly in the workspace",
+  "system_prompt": "You are an expert software engineer. Write clean, complete, working code. Use `run_shell_command` to inspect existing files or write/test changes.",
+  "provider": "",
+  "base_url": "",
+  "api_key": "",
+  "model": "",
+  "skills": [
+    "clean-code",
+    "shell-ops"
+  ],
+  "type": "agent"
+}

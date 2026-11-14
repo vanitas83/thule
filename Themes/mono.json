@@ -1,0 +1,10 @@
+{
+  "name": "mono",
+  "accent": "#e5e7eb",
+  "user": "#ffffff",
+  "ok": "#d1d5db",
+  "warn": "#9ca3af",
+  "err": "#ffffff",
+  "grad_start": "#ffffff",
+  "grad_end": "#6b7280"
+}

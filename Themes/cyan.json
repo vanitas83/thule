@@ -1,0 +1,10 @@
+{
+  "name": "cyan",
+  "accent": "#06b6d4",
+  "user": "#38bdf8",
+  "ok": "#22c55e",
+  "warn": "#eab308",
+  "err": "#ef4444",
+  "grad_start": "#06b6d4",
+  "grad_end": "#3b82f6"
+}

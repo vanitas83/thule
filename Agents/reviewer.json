@@ -1,0 +1,13 @@
+{
+  "name": "reviewer",
+  "description": "Audits code for bugs, edge cases, and polishes output",
+  "system_prompt": "You are a senior code reviewer. Check the preceding work for bugs, missing imports, or edge cases, fix any issues, and present the final clean output.",
+  "provider": "",
+  "base_url": "",
+  "api_key": "",
+  "model": "",
+  "skills": [
+    "concise-review"
+  ],
+  "type": "agent"
+}

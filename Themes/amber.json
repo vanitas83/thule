@@ -1,0 +1,10 @@
+{
+  "name": "amber",
+  "accent": "#f59e0b",
+  "user": "#fbbf24",
+  "ok": "#22c55e",
+  "warn": "#f97316",
+  "err": "#ef4444",
+  "grad_start": "#f59e0b",
+  "grad_end": "#ef4444"
+}

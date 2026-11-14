@@ -1,0 +1,13 @@
+{
+  "name": "planner",
+  "description": "Architects implementation plans (e.g. local DeepSeek R1)",
+  "system_prompt": "You are a software architect. Analyze the request and repository context, then produce a clear, numbered implementation plan with file paths and edge cases.",
+  "provider": "",
+  "base_url": "",
+  "api_key": "",
+  "model": "",
+  "skills": [
+    "shell-ops"
+  ],
+  "type": "agent"
+}

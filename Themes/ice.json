@@ -1,0 +1,10 @@
+{
+  "name": "ice",
+  "accent": "#a2d2ff",
+  "user": "#ffffff",
+  "ok": "#b2ffb2",
+  "warn": "#fff9c4",
+  "err": "#ffc1e3",
+  "grad_start": "#bde0fe",
+  "grad_end": "#ffafcc"
+}

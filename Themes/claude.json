@@ -1,0 +1,10 @@
+{
+  "name": "claude",
+  "accent": "#d97757",
+  "user": "#e89b7e",
+  "ok": "#6b9e78",
+  "warn": "#d99b52",
+  "err": "#c94a4a",
+  "grad_start": "#e08263",
+  "grad_end": "#b85636"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "default",
+  "description": "General-purpose local terminal assistant",
+  "system_prompt": "You are a concise local terminal AI assistant. Use `run_shell_command` when needed.",
+  "provider": "",
+  "base_url": "",
+  "api_key": "",
+  "model": "",
+  "skills": [
+    "shell-ops"
+  ],
+  "type": "agent"
+}

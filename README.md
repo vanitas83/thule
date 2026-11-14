@@ -19,15 +19,15 @@
 
 Full documentation is available in the [`docs/`](docs/) directory:
 
-- [**Overview & Architecture**](docs/overview.md) — System diagram, core concepts, and directory layout.
-- [**Agent Specification & Authoring**](docs/agents.md) — Schema, system prompts, skills, and execution modes.
-- [**Skills & Claude SKILL.md Compatibility**](docs/skills.md) — Full support for Claude Code `SKILL.md` folders and YAML frontmatter.
-- [**Theme & Layout Guide**](docs/themes.md) — Palettes, gradient engine, and split-pane layout configurations.
-- [**Workflow Pipelines**](docs/workflows.md) — Multi-step sequential agent chains and state passing.
-- [**Plugin Authoring & SDK**](docs/plugins.md) — Writing Python plugins with `PluginAPI` for custom tools, commands, and tabs.
-- [**Lifecycle Hooks Reference**](docs/hooks.md) — Intercepting `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
-- [**Custom Slash Commands**](docs/commands.md) — Reusable prompt templates and `$ARGUMENTS` substitution.
-- [**Configuration & Navigation**](docs/configuration.md) — Runtime configuration, provider profiles, and keyboard shortcuts.
+- [**Overview & Architecture**](Docs/overview.md) — System diagram, core concepts, and directory layout.
+- [**Agent Specification & Authoring**](Docs/agents.md) — Schema, system prompts, skills, and execution modes.
+- [**Skills & Claude SKILL.md Compatibility**](Docs/skills.md) — Full support for Claude Code `SKILL.md` folders and YAML frontmatter.
+- [**Theme & Layout Guide**](Docs/themes.md) — Palettes, gradient engine, and split-pane layout configurations.
+- [**Workflow Pipelines**](Docs/workflows.md) — Multi-step sequential agent chains and state passing.
+- [**Plugin Authoring & SDK**](Docs/plugins.md) — Writing Python plugins with `PluginAPI` for custom tools, commands, and tabs.
+- [**Lifecycle Hooks Reference**](Docs/hooks.md) — Intercepting `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`.
+- [**Custom Slash Commands**](Docs/commands.md) — Reusable prompt templates and `$ARGUMENTS` substitution.
+- [**Configuration & Navigation**](Docs/configuration.md) — Runtime configuration, provider profiles, and keyboard shortcuts.
 
 ---
 

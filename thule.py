@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Thule Local AI CLI — minimalist terminal coding assistant & agent orchestrator."""
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import argparse
 import atexit
@@ -15,10 +15,12 @@ import json
 import select
 import os
 import re
+import fnmatch
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -117,7 +119,7 @@ def _try_paste_clipboard_image() -> Optional[str]:
             if types_res.returncode == 0:
                 avail = set(types_res.stdout.splitlines())
                 for mime in ("image/png", "image/jpeg", "image/webp"):
-                    if mime in avail:
+                    if mime in avail or not avail:
                         img_res = subprocess.run(["wl-paste", "--no-newline", "--type", mime], capture_output=True, timeout=1.5)
                         if img_res.returncode == 0 and img_res.content:
                             image_bytes = img_res.content
@@ -131,6 +133,29 @@ def _try_paste_clipboard_image() -> Optional[str]:
             if img_res.returncode == 0 and img_res.content:
                 image_bytes = img_res.content
                 image_ext = "png"
+        except Exception:
+            pass
+    if not image_bytes and shutil.which("pngpaste"):
+        try:
+            tmp_mac = BASE_DIR / "Artifacts" / f".clip_{os.getpid()}.png"
+            tmp_mac.parent.mkdir(parents=True, exist_ok=True)
+            res = subprocess.run(["pngpaste", str(tmp_mac)], capture_output=True, timeout=1.5)
+            if res.returncode == 0 and tmp_mac.exists():
+                image_bytes = tmp_mac.read_bytes()
+                image_ext = "png"
+            tmp_mac.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if not image_bytes and os.name == "nt":
+        try:
+            tmp_win = BASE_DIR / "Artifacts" / f".clip_{os.getpid()}.png"
+            tmp_win.parent.mkdir(parents=True, exist_ok=True)
+            ps = f"Add-Type -AssemblyName System.Windows.Forms; $img=[Windows.Forms.Clipboard]::GetImage(); if($img){{$img.Save('{tmp_win}',[Drawing.Imaging.ImageFormat]::Png)}}"
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=2.0)
+            if tmp_win.exists() and tmp_win.stat().st_size > 0:
+                image_bytes = tmp_win.read_bytes()
+                image_ext = "png"
+            tmp_win.unlink(missing_ok=True)
         except Exception:
             pass
     if image_bytes:
@@ -220,12 +245,22 @@ def read_key(timeout: Optional[float] = None) -> str:
                 return "WHEEL_UP"
             if btn == 97:
                 return "WHEEL_DOWN"
+            if btn in (32, 33, 34):
+                col = max(1, raw[4] - 32)
+                row = max(1, raw[5] - 32)
+                return f"MOUSE_CLICK:{btn - 32}:{col}:{row}"
             return ""
         seq = raw.decode("utf-8", errors="ignore")
         if "\x1b[<64;" in seq or "\x1b[64;" in seq:
             return "WHEEL_UP"
         if "\x1b[<65;" in seq or "\x1b[65;" in seq:
             return "WHEEL_DOWN"
+        m_sgr = re.search(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])", seq)
+        if m_sgr:
+            b_code, col_s, row_s, phase = m_sgr.groups()
+            if phase == "M" and b_code in ("0", "1", "2"):
+                return f"MOUSE_CLICK:{b_code}:{col_s}:{row_s}"
+            return ""
         if seq.startswith("\x1b[<"):
             return ""
         seq_map = {
@@ -328,7 +363,9 @@ COMMANDS_DIR = BASE_DIR / "commands"
 CHECKPOINTS_DIR = BASE_DIR / "Checkpoints"
 ARTIFACTS_DIR = BASE_DIR / "Artifacts"
 HOOKS_FILE = BASE_DIR / "hooks.json"
+GLOBAL_MEMORY_FILE = BASE_DIR / "MEMORY.md"
 
+MCP_CONFIG_FILE = BASE_DIR / "mcp.json"
 LOGO_LINES = [
     "   )=(",
     "   ( )",
@@ -416,7 +453,7 @@ def sanitize_layout(raw: Any) -> Dict[str, Any]:
         ly["compact_logo"] = bool(raw["compact_logo"])
     return ly
 
-TABS = ["prompt", "agents", "advanced", "history", "settings"]
+TABS = ["prompt", "agents", "mcp", "advanced", "history", "settings"]
 
 PROVIDER_PRESETS: List[Dict[str, str]] = [
     {
@@ -592,6 +629,16 @@ class AgentDef:
 class WorkflowStep:
     agent: str
     instruction: str
+    id: str = ""
+    when: str = ""
+    on_pass: str = ""
+    on_fail: str = ""
+    next: str = ""
+    max_retries: int = 0
+    provider: str = ""
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
 
 
 @dataclass
@@ -623,6 +670,10 @@ class Config:
     auto_docs_skills: bool = True
     stream: bool = True
     command_timeout: int = 60
+    permission_mode: str = "ask"
+    notify_long_turns: bool = False
+    notify_threshold_sec: int = 15
+    mouse_support: bool = True
 
     @classmethod
     def load(cls) -> "Config":
@@ -894,6 +945,27 @@ def seed_defaults() -> None:
 
 
 
+    if not MCP_CONFIG_FILE.exists():
+        _atomic_write_text(
+            MCP_CONFIG_FILE,
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "obsidian": {
+                            "command": "npx",
+                            "args": ["-y", "mcp-obsidian", str(Path.home() / "Documents" / "ObsidianVault")],
+                            "disabled": True,
+                        },
+                        "roblox": {
+                            "command": "npx",
+                            "args": ["-y", "roblox-mcp"],
+                            "disabled": True,
+                        },
+                    }
+                },
+                indent=2,
+            ),
+        )
 EMBEDDED_DOCS: Dict[str, str] = {
     "overview": """# Thule Architecture Overview
 Thule is a terminal-based local AI engineering assistant supporting multi-agent orchestration,
@@ -948,7 +1020,11 @@ Schema:
 - "description": string (1-line summary)
 - "steps": array of objects, each containing:
     * "agent": string (name of an existing agent, e.g. 'planner', 'coder', 'reviewer')
-    * "instruction": string (concrete task instruction for that step)
+    * "instruction": string (concrete task instruction; supports {{goal}}, {{prev}}, {{steps.<id>}})
+    * "id": optional step label for {{steps.<id>}} references and branch targets
+    * "when": optional condition (e.g. "contains:FAIL", "!contains:PASS", "regex:ERROR", "prev != ''")
+    * "on_pass" / "on_fail" / "next": optional target step id (or "end") for branching/loops
+    * "max_retries": optional int (max re-entries when jumping back to this step, default 0)
 - "type": "workflow"
 Context and diffs are handed off sequentially between agents across all pipeline steps.""",
 
@@ -1258,6 +1334,329 @@ class PluginRegistry:
 PLUGIN_REGISTRY = PluginRegistry()
 
 
+
+
+# ==============================================================================
+# MODEL CONTEXT PROTOCOL (MCP) STDIO CLIENT & MANAGER
+# ==============================================================================
+class MCPClient:
+    def __init__(self, name: str, config: Dict[str, Any], source_file: str = "") -> None:
+        self.name = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_") or "server"
+        self.raw_name = name
+        self.command = str(config.get("command", "")).strip()
+        self.args = [str(a) for a in (config.get("args") or [])]
+        self.env = {**os.environ, **{str(k): str(v) for k, v in (config.get("env") or {}).items()}}
+        self.cwd = str(config.get("cwd")) if config.get("cwd") else None
+        self.disabled = bool(config.get("disabled", False))
+        self.source_file = source_file
+        self.proc: Optional[asyncio.subprocess.Process] = None
+        self.tools: List[Dict[str, Any]] = []
+        self.server_info: Dict[str, Any] = {}
+        self.status = "DISABLED" if self.disabled else "DISCONNECTED"
+        self.error = ""
+        self._req_id = 0
+        self._lock = asyncio.Lock()
+        self._stderr_tail: List[str] = []
+        self._stderr_task: Optional[asyncio.Task] = None
+
+    async def _drain_stderr(self) -> None:
+        if not self.proc or not self.proc.stderr:
+            return
+        try:
+            while True:
+                line = await self.proc.stderr.readline()
+                if not line:
+                    break
+                txt = line.decode("utf-8", errors="replace").strip()
+                if txt:
+                    self._stderr_tail.append(txt)
+                    if len(self._stderr_tail) > 12:
+                        self._stderr_tail.pop(0)
+        except Exception:
+            pass
+
+    async def start(self) -> None:
+        await self.stop()
+        if self.disabled:
+            self.status = "DISABLED"
+            self.error = ""
+            self.tools = []
+            return
+        if not self.command:
+            self.status = "ERROR"
+            self.error = "Missing 'command' in mcp.json"
+            return
+        self.status = "CONNECTING"
+        self.error = ""
+        self._stderr_tail.clear()
+        try:
+            cmd_path = shutil.which(self.command) or self.command
+            self.proc = await asyncio.create_subprocess_exec(
+                cmd_path,
+                *self.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self.env,
+                cwd=self.cwd,
+            )
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
+            init_res = await self._send_request(
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"roots": {"listChanged": False}},
+                    "clientInfo": {"name": "thule", "version": __version__},
+                },
+                timeout=15.0,
+            )
+            if "error" in init_res:
+                raise RuntimeError(str(init_res["error"]))
+            res_obj = init_res.get("result") or {}
+            self.server_info = res_obj.get("serverInfo") or {}
+            await self._send_notification("notifications/initialized", {})
+
+            tools_res = await self._send_request("tools/list", {}, timeout=12.0)
+            if "error" in tools_res:
+                raise RuntimeError(str(tools_res["error"]))
+            self.tools = (tools_res.get("result") or {}).get("tools") or []
+            self.status = "ONLINE"
+        except Exception as exc:
+            self.status = "ERROR"
+            tail = f" | stderr: {self._stderr_tail[-1]}" if self._stderr_tail else ""
+            self.error = f"{exc}{tail}"
+
+    async def _send_request(self, method: str, params: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+        async with self._lock:
+            if not self.proc or not self.proc.stdin or not self.proc.stdout:
+                raise RuntimeError("MCP server process not running")
+            self._req_id += 1
+            req_id = self._req_id
+            payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}) + "\n"
+            self.proc.stdin.write(payload.encode("utf-8"))
+            await self.proc.stdin.drain()
+
+            async def _read_until_id() -> Dict[str, Any]:
+                assert self.proc is not None and self.proc.stdout is not None
+                while True:
+                    line = await self.proc.stdout.readline()
+                    if not line:
+                        rc = self.proc.returncode
+                        raise RuntimeError(f"EOF from MCP server (exit={rc})")
+                    raw = line.decode("utf-8", errors="replace").strip()
+                    if not raw:
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("id") == req_id:
+                        return msg
+
+            return await asyncio.wait_for(_read_until_id(), timeout=timeout)
+
+    async def _send_notification(self, method: str, params: Dict[str, Any]) -> None:
+        if not self.proc or not self.proc.stdin:
+            return
+        payload = json.dumps({"jsonrpc": "2.0", "method": method, "params": params}) + "\n"
+        self.proc.stdin.write(payload.encode("utf-8"))
+        await self.proc.stdin.drain()
+
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        if self.status != "ONLINE":
+            return f"Error: MCP server '{self.name}' is {self.status} ({self.error})"
+        try:
+            res = await self._send_request("tools/call", {"name": tool_name, "arguments": arguments}, timeout=60.0)
+            if "error" in res:
+                return f"MCP Tool Error: {res['error']}"
+            result_obj = res.get("result") or {}
+            content = result_obj.get("content") or []
+            chunks: List[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                itype = item.get("type", "")
+                if itype == "text":
+                    chunks.append(str(item.get("text", "")))
+                elif itype == "resource":
+                    res_inner = item.get("resource") or {}
+                    chunks.append(str(res_inner.get("text") or res_inner.get("uri") or json.dumps(res_inner)))
+                else:
+                    chunks.append(json.dumps(item))
+            out = "\n".join(c for c in chunks if c).strip()
+            if not out:
+                out = json.dumps(result_obj)
+            if result_obj.get("isError"):
+                return f"MCP Tool Reported Error:\n{out}"
+            return out
+        except Exception as exc:
+            return f"MCP Call Failed ({self.name}.{tool_name}): {exc}"
+
+    async def stop(self) -> None:
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            self._stderr_task = None
+        if self.proc:
+            try:
+                self.proc.terminate()
+                await asyncio.wait_for(self.proc.wait(), timeout=2.0)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+        if not self.disabled:
+            self.status = "DISCONNECTED"
+
+
+class MCPManager:
+    def __init__(self) -> None:
+        self.clients: Dict[str, MCPClient] = {}
+        self._tool_route: Dict[str, Tuple[str, str]] = {}
+        self.load_errors: List[str] = []
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run_sync(self, coro: Any, timeout: float = 30.0) -> Any:
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout=timeout)
+
+    async def _reload_async(self) -> None:
+        for client in list(self.clients.values()):
+            await client.stop()
+        self.clients.clear()
+        self._tool_route.clear()
+        self.load_errors.clear()
+
+        merged_servers: Dict[str, Tuple[Dict[str, Any], Path]] = {}
+        for cfg_path in (MCP_CONFIG_FILE, Path.cwd() / ".thule" / "mcp.json"):
+            if cfg_path.is_file():
+                try:
+                    data = json.loads(cfg_path.read_text())
+                    servers = data.get("mcpServers") or {}
+                    if isinstance(servers, dict):
+                        for sname, scfg in servers.items():
+                            if isinstance(scfg, dict):
+                                merged_servers[sname] = (scfg, cfg_path)
+                except Exception as exc:
+                    self.load_errors.append(f"{cfg_path.name}: {exc}")
+
+        tasks = []
+        for sname, (scfg, cfg_path) in merged_servers.items():
+            client = MCPClient(sname, scfg, source_file=str(cfg_path))
+            self.clients[client.name] = client
+            tasks.append(client.start())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._rebuild_routes()
+
+    def _rebuild_routes(self) -> None:
+        self._tool_route.clear()
+        for sname, client in self.clients.items():
+            if client.status != "ONLINE":
+                continue
+            for t in client.tools:
+                orig_name = str(t.get("name", "")).strip()
+                if not orig_name:
+                    continue
+                clean_tool = re.sub(r"[^a-zA-Z0-9_-]+", "_", orig_name).strip("_")
+                full_name = f"mcp_{sname}_{clean_tool}"[:64]
+                self._tool_route[full_name] = (sname, orig_name)
+
+    def reload(self) -> None:
+        try:
+            self.run_sync(self._reload_async(), timeout=25.0)
+        except Exception as exc:
+            self.load_errors.append(str(exc))
+
+    def toggle_server(self, server_name: str) -> str:
+        client = self.clients.get(server_name)
+        if not client:
+            return f"Server '{server_name}' not found"
+        cfg_path = Path(client.source_file) if client.source_file else MCP_CONFIG_FILE
+        try:
+            data = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {"mcpServers": {}}
+            servers = data.setdefault("mcpServers", {})
+            entry = servers.setdefault(client.raw_name, {"command": client.command, "args": client.args})
+            new_disabled = not bool(entry.get("disabled", False))
+            entry["disabled"] = new_disabled
+            _atomic_write_text(cfg_path, json.dumps(data, indent=2))
+            self.reload()
+            return f"{'Disabled' if new_disabled else 'Enabled'} MCP server '{client.raw_name}'"
+        except Exception as exc:
+            return f"Failed to toggle '{server_name}': {exc}"
+
+    def tool_definitions(self) -> List[Dict[str, Any]]:
+        defs: List[Dict[str, Any]] = []
+        for sname, client in self.clients.items():
+            if client.status != "ONLINE":
+                continue
+            for t in client.tools:
+                orig_name = str(t.get("name", "")).strip()
+                if not orig_name:
+                    continue
+                clean_tool = re.sub(r"[^a-zA-Z0-9_-]+", "_", orig_name).strip("_")
+                full_name = f"mcp_{sname}_{clean_tool}"[:64]
+                schema = t.get("inputSchema")
+                if not isinstance(schema, dict):
+                    schema = {"type": "object", "properties": {}}
+                defs.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": full_name,
+                            "description": f"[MCP:{sname}] {t.get('description', orig_name)}",
+                            "parameters": schema,
+                        },
+                    }
+                )
+        return defs
+
+    def has_tool(self, fn_name: str) -> bool:
+        return fn_name in self._tool_route or fn_name.startswith("mcp_")
+
+    def server_for_tool(self, fn_name: str) -> Optional[str]:
+        if fn_name in self._tool_route:
+            return self._tool_route[fn_name][0]
+        if fn_name.startswith("mcp_"):
+            parts = fn_name[4:].split("_", 1)
+            return parts[0] if parts else None
+        return None
+
+    async def call_tool(self, fn_name: str, arguments: Dict[str, Any]) -> str:
+        route = self._tool_route.get(fn_name)
+        if not route and fn_name.startswith("mcp_"):
+            parts = fn_name[4:].split("_", 1)
+            if len(parts) == 2:
+                route = (parts[0], parts[1])
+        if not route:
+            return f"Unknown MCP tool: {fn_name}"
+        sname, orig_name = route
+        client = self.clients.get(sname)
+        if not client:
+            return f"MCP server '{sname}' is not configured."
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(client.call_tool(orig_name, arguments), self._loop)
+        )
+
+    def shutdown(self) -> None:
+        try:
+            async def _stop_all() -> None:
+                for c in list(self.clients.values()):
+                    await c.stop()
+            self.run_sync(_stop_all(), timeout=5.0)
+        except Exception:
+            pass
+
+
+MCP_MANAGER = MCPManager()
+atexit.register(MCP_MANAGER.shutdown)
 def load_custom_commands() -> Dict[str, str]:
     cmds: Dict[str, str] = {}
     for folder in (COMMANDS_DIR, Path.cwd() / ".thule" / "commands", Path.cwd() / ".opencode" / "commands"):
@@ -1315,18 +1714,63 @@ def run_lifecycle_hooks(event: str, payload: Dict[str, Any]) -> tuple[bool, str]
     return True, "\n".join(feedback)
 
 
-def parse_frontmatter(text: str) -> tuple[Dict[str, str], str]:
-    meta: Dict[str, str] = {}
+@dataclass
+class SkillDef:
+    name: str
+    description: str
+    body: str
+    path: Path
+    base_dir: Optional[Path] = None
+    when_to_use: str = ""
+    argument_hint: str = ""
+    arguments_spec: List[Dict[str, Any]] = field(default_factory=list)
+    user_invocable: bool = True
+    disable_model_invocation: bool = False
+    allowed_tools: List[str] = field(default_factory=list)
+    context_mode: str = "inline"
+    subagent_type: str = "reviewer"
+    model_override: Optional[str] = None
+    paths_glob: List[str] = field(default_factory=list)
+    compatibility: str = ""
+    resources: List[str] = field(default_factory=list)
+
+    @property
+    def full_trigger_description(self) -> str:
+        if self.when_to_use:
+            extra = " ".join(ln.strip("- ") for ln in self.when_to_use.splitlines() if ln.strip())
+            return f"{self.description} ({extra})"[:320]
+        return self.description[:240]
+
+
+def _parse_bool(val: Any, default: bool) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() not in ("false", "0", "no", "off")
+
+
+def _parse_str_list(val: Any) -> List[str]:
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        return [x.strip() for x in val.split(",") if x.strip()]
+    return []
+
+
+def parse_frontmatter(text: str) -> tuple[Dict[str, Any], str]:
+    meta: Dict[str, Any] = {}
     body = text
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, flags=re.DOTALL)
     if m:
-        fm_text = m.group(1)
-        body = m.group(2)
+        fm_text, body = m.group(1), m.group(2)
         try:
             import yaml
             parsed = yaml.safe_load(fm_text)
             if isinstance(parsed, dict):
-                meta = {str(k).lower(): str(v) for k, v in parsed.items()}
+                meta = {str(k).lower(): v for k, v in parsed.items()}
         except Exception:
             for line in fm_text.splitlines():
                 if ":" in line and not line.strip().startswith("#"):
@@ -1335,20 +1779,20 @@ def parse_frontmatter(text: str) -> tuple[Dict[str, str], str]:
     return meta, body.strip()
 
 
-def load_skills() -> Dict[str, str]:
-    """Load skills supporting both Claude SKILL.md folder structure and traditional flat .md files."""
-    skills: Dict[str, str] = {}
+def load_skills() -> Dict[str, SkillDef]:
+    """Load Agent Skills (SKILL.md directories) and legacy flat .md skills."""
+    skills: Dict[str, SkillDef] = {}
     search_dirs: List[Path] = [
         Path.cwd() / ".claude" / "skills",
-        Path.cwd() / "skills",
-        Path.cwd() / ".thule" / "Skills",
         Path.cwd() / ".thule" / "skills",
+        Path.cwd() / ".thule" / "Skills",
+        Path.cwd() / "skills",
         SKILLS_DIR,
         Path.home() / ".claude" / "skills",
         Path.home() / ".local_ai_cli" / "skills",
     ]
     seen_dirs = set()
-    valid_folders = []
+    valid_folders: List[Path] = []
     for d in search_dirs:
         try:
             res = d.resolve()
@@ -1360,63 +1804,133 @@ def load_skills() -> Dict[str, str]:
 
     for folder in valid_folders:
         try:
-            # 1. Claude-style skill directories: <folder>/<slug>/SKILL.md
             for sub in sorted(folder.iterdir()):
-                if sub.is_dir() and not sub.name.startswith("."):
-                    skill_file = None
-                    for candidate in ("SKILL.md", "skill.md", "Skill.md"):
-                        cf = sub / candidate
-                        if cf.is_file():
-                            skill_file = cf
-                            break
-                    if skill_file:
-                        try:
-                            raw_text = skill_file.read_text(errors="ignore").strip()
-                            meta, body = parse_frontmatter(raw_text)
-                            slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", meta.get("name") or sub.name).strip("-").lower()
-                            if slug and slug not in skills:
-                                extra_resources: List[str] = []
-                                for res_dir in ("scripts", "references", "examples", "resources"):
-                                    rf = sub / res_dir
-                                    if rf.is_dir():
-                                        sub_files = [p.name for p in sorted(rf.iterdir()) if not p.name.startswith(".")]
-                                        if sub_files:
-                                            extra_resources.append(f"- **{res_dir}/**: `{rf}` ({', '.join(sub_files[:8])})")
-                                full_content = body
-                                if extra_resources:
-                                    full_content += "\n\n### Skill Resources\n" + "\n".join(extra_resources)
-                                skills[slug] = full_content
-                        except Exception:
-                            pass
+                if not sub.is_dir() or sub.name.startswith("."):
+                    continue
+                skill_file = next(
+                    (sub / c for c in ("SKILL.md", "skill.md", "Skill.md") if (sub / c).is_file()),
+                    None,
+                )
+                if not skill_file:
+                    continue
+                try:
+                    raw_text = skill_file.read_text(errors="ignore").strip()
+                    meta, body = parse_frontmatter(raw_text)
+                    raw_name = str(meta.get("name") or sub.name).strip().lower()
+                    slug = re.sub(r"[^a-z0-9-]+", "-", raw_name).strip("-")
+                    if not slug or slug in skills:
+                        continue
+                    res_files: List[str] = []
+                    for p in sorted(sub.rglob("*")):
+                        if p.is_file() and p != skill_file and not any(part.startswith(".") for part in p.relative_to(sub).parts):
+                            res_files.append(str(p.relative_to(sub)))
+                    first_line = next((ln.lstrip("# ").strip() for ln in body.splitlines() if ln.strip()), slug)
+                    desc = str(meta.get("description") or first_line).strip()
+                    args_spec = meta.get("arguments") if isinstance(meta.get("arguments"), list) else []
+                    skills[slug] = SkillDef(
+                        name=slug,
+                        description=desc,
+                        body=body,
+                        path=skill_file,
+                        base_dir=sub,
+                        when_to_use=str(meta.get("when_to_use") or "").strip(),
+                        argument_hint=str(meta.get("argument-hint") or "").strip(),
+                        arguments_spec=[a for a in args_spec if isinstance(a, dict)],
+                        user_invocable=_parse_bool(meta.get("user-invocable"), True),
+                        disable_model_invocation=_parse_bool(meta.get("disable-model-invocation"), False),
+                        allowed_tools=_parse_str_list(meta.get("allowed-tools")),
+                        context_mode=str(meta.get("context") or "inline").strip().lower(),
+                        subagent_type=str(meta.get("agent") or "reviewer").strip(),
+                        model_override=str(meta["model"]).strip() if meta.get("model") else None,
+                        paths_glob=_parse_str_list(meta.get("paths")),
+                        compatibility=str(meta.get("compatibility") or "").strip(),
+                        resources=res_files,
+                    )
+                except Exception:
+                    pass
 
-            # 2. Flat markdown skills: <folder>/<name>.md
             for p in sorted(folder.glob("*.md")):
                 if p.is_file() and p.name.upper() not in ("SKILL.MD", "README.MD"):
                     try:
                         raw_text = p.read_text(errors="ignore").strip()
                         meta, body = parse_frontmatter(raw_text)
-                        slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", meta.get("name") or p.stem).strip("-").lower()
-                        if slug and slug not in skills:
-                            skills[slug] = body
+                        slug = re.sub(r"[^a-z0-9-]+", "-", str(meta.get("name") or p.stem).lower()).strip("-")
+                        if not slug or slug in skills:
+                            continue
+                        first_line = next((ln.lstrip("# ").strip() for ln in body.splitlines() if ln.strip()), slug)
+                        skills[slug] = SkillDef(
+                            name=slug,
+                            description=str(meta.get("description") or first_line).strip(),
+                            body=body,
+                            path=p,
+                            user_invocable=_parse_bool(meta.get("user-invocable"), True),
+                            disable_model_invocation=_parse_bool(meta.get("disable-model-invocation"), False),
+                            allowed_tools=_parse_str_list(meta.get("allowed-tools")),
+                        )
                     except Exception:
                         pass
         except Exception:
             pass
-
     return skills
 
 
-def load_agents_and_workflows() -> tuple[Dict[str, AgentDef], Dict[str, WorkflowDef]]:
+def render_skill_body(sk: SkillDef, arg_str: str = "", session_id: str = "", allow_shell: bool = False) -> str:
+    text = sk.body
+    skill_dir = str(sk.base_dir or sk.path.parent)
+    proj_dir = str(Path.cwd())
+    for var, val in (
+        ("${CLAUDE_SKILL_DIR}", skill_dir),
+        ("${THULE_SKILL_DIR}", skill_dir),
+        ("${CLAUDE_PROJECT_DIR}", proj_dir),
+        ("${THULE_PROJECT_DIR}", proj_dir),
+        ("${CLAUDE_SESSION_ID}", session_id),
+        ("${THULE_SESSION_ID}", session_id),
+    ):
+        text = text.replace(var, val)
+    tokens = shlex.split(arg_str) if arg_str else []
+    for idx, tok in enumerate(tokens):
+        text = text.replace(f"${idx}", tok)
+    for idx, spec in enumerate(sk.arguments_spec):
+        aname = str(spec.get("name", "")).strip()
+        if aname:
+            val = tokens[idx] if idx < len(tokens) else str(spec.get("default") or "")
+            text = re.sub(rf"\${re.escape(aname)}\b", val, text)
+    if "$ARGUMENTS" in text:
+        text = text.replace("$ARGUMENTS", arg_str)
+    elif arg_str:
+        text += f"\n\nUser Arguments: {arg_str}"
+    if allow_shell:
+        def _exec_inline(m: re.Match) -> str:
+            cmd = m.group(1).strip()
+            try:
+                res = subprocess.run(cmd, shell=True, cwd=proj_dir, capture_output=True, text=True, timeout=10)
+                return (res.stdout or res.stderr or "").strip()[:8000]
+            except Exception as e:
+                return f"[command failed: {e}]"
+        text = re.sub(r"```!\s*\n(.*?)\n```", _exec_inline, text, flags=re.DOTALL)
+        text = re.sub(r"(?m)(^|\s)!`([^`\n]+)`", lambda m: f"{m.group(1)}{_exec_inline(re.match(r'(.*)', m.group(2)))}", text)
+    return text
+
+
+
+
+
+def load_agents_and_workflows() -> Tuple[Dict[str, AgentDef], Dict[str, WorkflowDef]]:
     agents: Dict[str, AgentDef] = {}
     workflows: Dict[str, WorkflowDef] = {}
-    for folder in (AGENTS_DIR, Path.cwd() / "Agents"):
+    for folder in (AGENTS_DIR, Path.cwd() / ".thule" / "Agents", Path.cwd() / "Agents"):
         if not folder.exists():
             continue
         for p in sorted(folder.glob("*.json")):
             try:
                 data = json.loads(p.read_text())
                 if data.get("type") == "workflow" or "steps" in data:
-                    steps = [WorkflowStep(**s) for s in data.get("steps", [])]
+                    step_fields = WorkflowStep.__dataclass_fields__
+                    steps = [
+                        WorkflowStep(**{k: v for k, v in s.items() if k in step_fields})
+                        for s in data.get("steps", [])
+                        if isinstance(s, dict)
+                    ]
                     wf_name = data.get("name", p.stem)
                     workflows[wf_name] = WorkflowDef(
                         name=wf_name,
@@ -1427,8 +1941,8 @@ def load_agents_and_workflows() -> tuple[Dict[str, AgentDef], Dict[str, Workflow
                     valid = {k: v for k, v in data.items() if k in AgentDef.__dataclass_fields__}
                     valid.setdefault("name", p.stem)
                     agents[valid["name"]] = AgentDef(**valid)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[thule] Warning: failed to parse {p}: {exc}", file=sys.stderr)
     return agents, workflows
 
 
@@ -1556,6 +2070,42 @@ TOOL_DEFINITIONS = [
                     "end_line": {"type": "integer", "description": "1-based end line (optional)"},
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": "Ask the user a clarifying question or present numbered options to choose from before proceeding.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Clear question for the user"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of selectable choices"
+                    }
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fuzzy_edit_file",
+            "description": "Fuzzy second alternative to edit_file: locates the closest matching line window even when indentation or minor whitespace differs, previews a unified diff, and applies the edit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to edit"},
+                    "target": {"type": "string", "description": "Approximate existing code block to replace"},
+                    "replacement": {"type": "string", "description": "Replacement code block"},
+                    "threshold": {"type": "number", "description": "Similarity threshold 0.5-1.0 (default 0.78)"},
+                },
+                "required": ["path", "target", "replacement"],
             },
         },
     },
@@ -1693,6 +2243,21 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "get_skill_resource",
+            "description": "Read a supporting file inside an Agent Skill directory (e.g. 'references/REFERENCE.md', 'scripts/run.py', 'assets/template.json').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "Skill slug name"},
+                    "resource_path": {"type": "string", "description": "Relative path from the skill root directory"},
+                },
+                "required": ["skill_name", "resource_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_skill",
             "description": "Create a Claude-compatible SKILL.md folder (skills/<name>/SKILL.md) with YAML frontmatter and activate it.",
             "parameters": {
@@ -1802,9 +2367,9 @@ def get_all_tool_definitions(allow_docs_skills: bool = True) -> List[Dict[str, A
     base_tools = (
         TOOL_DEFINITIONS
         if allow_docs_skills
-        else [t for t in TOOL_DEFINITIONS if t["function"]["name"] not in ("get_documentation", "get_skill")]
+        else [t for t in TOOL_DEFINITIONS if t["function"]["name"] not in ("get_documentation", "get_skill", "get_skill_resource")]
     )
-    return base_tools + PLUGIN_REGISTRY.tool_definitions()
+    return base_tools + PLUGIN_REGISTRY.tool_definitions() + MCP_MANAGER.tool_definitions()
 
 
 
@@ -1914,6 +2479,7 @@ class LocalAICLI:
         self.console = Console()
         self.config = Config.load()
         PLUGIN_REGISTRY.reload(self.config.disabled_plugins)
+        MCP_MANAGER.reload()
         self.active_tab = "prompt"
         self.chat_items: List[Any] = []
         self.thoughts: List[str] = []
@@ -1923,6 +2489,10 @@ class LocalAICLI:
         self.prompt_history: List[str] = []
         self.scroll_offset = 0
         self.session_id = datetime.now().strftime("session-%Y%m%d-%H%M%S")
+        self.session_name = "default"
+        self.pending_images: List[Dict[str, Any]] = []
+        self._last_nav_hits: List[Tuple[int, int, str]] = []
+        self._last_split_hits: List[Tuple[int, int, int, int, int]] = []
         self._active_spinners: List[Dict[str, Any]] = []
         self._spinner_task: Optional[asyncio.Task] = None
         self._spinner_seq = 0
@@ -2009,10 +2579,27 @@ class LocalAICLI:
         sys.stdout.flush()
 
     def resolve_endpoint(self, agent: AgentDef) -> tuple[str, str, str, str]:
-        provider = agent.provider.strip() or self.config.provider
-        base_url = (agent.base_url.strip() or self.config.base_url).rstrip("/")
-        api_key = agent.api_key.strip() if agent.api_key.strip() else self.config.api_key
+        provider = (agent.provider.strip() or self.config.provider).lower()
         model = agent.model.strip() or self.config.model
+        if ":" in model and model.split(":", 1)[0].lower() in ("ollama", "gemini", "openrouter", "openai", "llamacpp", "lmstudio"):
+            provider, model = model.split(":", 1)[0].lower(), model.split(":", 1)[1].strip()
+        if agent.base_url.strip():
+            base_url = agent.base_url.strip().rstrip("/")
+        elif provider != self.config.provider:
+            preset = next((p for p in PROVIDER_PRESETS if p["id"] == provider), None)
+            base_url = (preset["url"] if preset else self.config.base_url).rstrip("/")
+        else:
+            base_url = self.config.base_url.rstrip("/")
+        if agent.api_key.strip():
+            api_key = agent.api_key.strip()
+        elif provider == "gemini":
+            api_key = (self.config.api_key if self.config.provider == "gemini" else "") or os.environ.get("GEMINI_API_KEY", "")
+        elif provider == "openrouter":
+            api_key = (self.config.api_key if self.config.provider == "openrouter" else "") or os.environ.get("OPENROUTER_API_KEY", "")
+        elif provider == "openai":
+            api_key = (self.config.api_key if self.config.provider == "openai" else "") or os.environ.get("OPENAI_API_KEY", "")
+        else:
+            api_key = self.config.api_key if provider == self.config.provider else ""
         return provider, base_url, api_key, model
 
     def save_session(self) -> None:
@@ -2024,15 +2611,65 @@ class LocalAICLI:
             if m.get("role") == "user":
                 title = m.get("content", "").strip().splitlines()[0][:50]
                 break
+        if self.session_name and self.session_name != "default":
+            title = self.session_name
         payload = {
             "id": self.session_id,
+            "name": self.session_name,
             "title": title,
+            "cwd": str(Path.cwd()),
+            "model": f"{self.config.provider}:{self.config.model}",
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "messages": self.messages,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
         }
         _atomic_write_text(SESSIONS_DIR / f"{self.session_id}.json", json.dumps(payload, indent=2))
+
+    def fork_current_session(self, fork_name: str = "") -> str:
+        import copy as _cp
+        new_id = datetime.now().strftime("session-%Y%m%d-%H%M%S") + f"-{os.urandom(2).hex()}"
+        parent_id = self.session_id
+        self.session_id = new_id
+        self.session_name = fork_name.strip() or f"fork-of-{parent_id[-6:]}"
+        self.messages = _cp.deepcopy(self.messages)
+        self.save_session()
+        return new_id
+
+    def _notify_turn_finished(self, elapsed_sec: float, summary: str) -> None:
+        if not self.config.notify_long_turns:
+            return
+        if elapsed_sec < max(1, int(self.config.notify_threshold_sec)):
+            return
+        try:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        title = f"Thule finished ({elapsed_sec:.1f}s)"
+        body = (summary or "Agent turn complete").strip()[:140]
+        if shutil.which("notify-send"):
+            try:
+                subprocess.Popen(["notify-send", "-a", "Thule CLI", title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        elif shutil.which("osascript"):
+            try:
+                subprocess.Popen(["osascript", "-e", f'display notification "{body}" with title "{title}"'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+    def _handle_global_mouse_click(self, col: int, row: int) -> Optional[str]:
+        if not self.config.mouse_support:
+            return None
+        for x1, x2, tab_name in getattr(self, "_last_nav_hits", []):
+            if row in (1, 2) and x1 <= col <= x2:
+                self.active_tab = tab_name
+                return f"TAB:{tab_name}"
+        for r_y1, r_y2, c_x1, c_x2, item_idx in getattr(self, "_last_split_hits", []):
+            if r_y1 <= row <= r_y2 and c_x1 <= col <= c_x2:
+                return f"ROW:{item_idx}"
+        return None
 
     def _ensure_sane_tty(self) -> None:
 
@@ -2126,6 +2763,15 @@ class LocalAICLI:
 
             key = read_key()
             if key == "RESIZE":
+                continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    m_row = int(parts_m[3])
+                    list_top = header_rows + 3
+                    clicked_off = m_row - list_top
+                    if 0 <= clicked_off < len(window):
+                        return scroll + clicked_off
                 continue
             if key in ("UP", "WHEEL_UP"):
                 idx = (idx - 1) % len(options)
@@ -2224,6 +2870,15 @@ class LocalAICLI:
                 cursor = max(0, cursor - 1)
             elif key == "RIGHT":
                 cursor = min(len(buf), cursor + 1)
+            elif key == "CTRL_V":
+                clip_txt = read_clipboard().replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+                if clip_txt:
+                    buf = buf[:cursor] + clip_txt + buf[cursor:]
+                    cursor += len(clip_txt)
+            elif key in ("HOME", "CTRL_A"):
+                cursor = 0
+            elif key in ("END", "CTRL_E"):
+                cursor = len(buf)
             elif key.startswith("PASTE:"):
                 clip_txt = key[6:].replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
                 buf = buf[:cursor] + clip_txt + buf[cursor:]
@@ -2533,11 +3188,15 @@ class LocalAICLI:
 
         nav = Text()
         cursor = 0
+        self._last_nav_hits = []
         for i, t in enumerate(all_tabs):
             if i > 0:
                 nav.append(sep, style="dim")
                 cursor += len(sep)
             label = t.upper()
+            x_start = nav_start_col + cursor + 1
+            x_end = x_start + len(label) - 1
+            self._last_nav_hits.append((x_start, x_end, t))
             if t == self.active_tab:
                 nav.append_text(universal_gradient_text(label, self.colors, nav_start_col + cursor, w, bold=True))
             else:
@@ -2785,23 +3444,80 @@ class LocalAICLI:
                 break
         self.chat_items.append("\n".join(lines))
 
-    def copy_last_response(self, code_only: bool = False) -> None:
+    def _collect_recent_code_blocks(self) -> List[Dict[str, str]]:
+        blocks: List[Dict[str, str]] = []
         for m in reversed(self.messages):
             if m.get("role") == "assistant" and m.get("content"):
                 clean = re.sub(r"<think>.*?</think>", "", str(m["content"]), flags=re.DOTALL).strip()
-                label = "last response"
-                if code_only:
-                    blocks = re.findall(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", clean, flags=re.DOTALL)
-                    if not blocks:
-                        self.chat_items.append("[dim]No fenced code block found in last response.[/]")
+                for match in re.finditer(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", clean, flags=re.DOTALL):
+                    lang = match.group(1).strip() or "text"
+                    code = match.group(2).strip("\n")
+                    first_ln = next((ln.strip() for ln in code.splitlines() if ln.strip()), "(empty)")
+                    blocks.append({"lang": lang, "code": code, "preview": first_ln[:56], "lines": str(len(code.splitlines()))})
+                if blocks:
+                    break
+        return blocks
+
+    def copy_last_response(self, code_only: bool = False, block_index: Optional[int] = None) -> None:
+        blocks = self._collect_recent_code_blocks()
+        if block_index is not None:
+            if not blocks or not (1 <= block_index <= len(blocks)):
+                self.chat_items.append(f"[{self.colors['warn']}]Code block #{block_index} not found (available: 1..{len(blocks)}).[/]")
+                return
+            chosen = blocks[block_index - 1]
+            ok, info = copy_to_clipboard(chosen["code"])
+            self.chat_items.append(
+                f"[{self.colors['ok']}]Copied code block #{block_index} ({chosen['lang']}, {chosen['lines']} lines) via {info}.[/]"
+                if ok else f"[{self.colors['err']}]Clipboard failed: {info}[/]"
+            )
+            return
+
+        if code_only:
+            if not blocks:
+                self.chat_items.append("[dim]No fenced code blocks found in the last response.[/]")
+                return
+            if len(blocks) == 1:
+                chosen = blocks[0]
+            else:
+                opts = [
+                    f"#{i} [{b['lang']}] ({b['lines']} lines) — {b['preview']}"
+                    for i, b in enumerate(blocks, 1)
+                ]
+                sel = self.select_menu("Code Block Copy Selector:", opts, header_fn=self.render_header)
+                if sel < 0:
+                    return
+                chosen = blocks[sel]
+            ok, info = copy_to_clipboard(chosen["code"])
+            self.chat_items.append(
+                f"[{self.colors['ok']}]Copied [{chosen['lang']}] block ({len(chosen['code'])} chars) via {info}.[/]"
+                if ok else f"[{self.colors['err']}]Clipboard failed: {info}[/]"
+            )
+            return
+
+        for m in reversed(self.messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                clean = re.sub(r"<think>.*?</think>", "", str(m["content"]), flags=re.DOTALL).strip()
+                if blocks:
+                    opts = [
+                        f"Full assistant response ({len(clean)} chars)",
+                        *[f"Code Block #{i} [{b['lang']}] ({b['lines']}L) — {b['preview']}" for i, b in enumerate(blocks, 1)],
+                    ]
+                    sel = self.select_menu("Copy Response or Code Block:", opts, header_fn=self.render_header)
+                    if sel < 0:
                         return
-                    clean = blocks[-1].strip()
-                    label = "last code block"
+                    if sel > 0:
+                        chosen = blocks[sel - 1]
+                        ok, info = copy_to_clipboard(chosen["code"])
+                        self.chat_items.append(
+                            f"[{self.colors['ok']}]Copied Code Block #{sel} [{chosen['lang']}] via {info}.[/]"
+                            if ok else f"[{self.colors['err']}]Clipboard failed: {info}[/]"
+                        )
+                        return
                 ok, info = copy_to_clipboard(clean)
-                if ok:
-                    self.chat_items.append(f"[{self.colors['ok']}]Copied {label} ({len(clean)} chars) via {info}.[/]")
-                else:
-                    self.chat_items.append(f"[{self.colors['err']}]Clipboard failed: {info}[/]")
+                self.chat_items.append(
+                    f"[{self.colors['ok']}]Copied full response ({len(clean)} chars) via {info}.[/]"
+                    if ok else f"[{self.colors['err']}]Clipboard failed: {info}[/]"
+                )
                 return
         self.chat_items.append("[dim]No assistant response to copy yet.[/]")
 
@@ -2861,6 +3577,7 @@ class LocalAICLI:
     def open_command_palette(self) -> Optional[str]:
         actions = [
             ("/create", "AI-generate a workflow, agent, theme, or plugin"),
+            ("/mcp", "Inspect, toggle, or reload Obsidian/Roblox MCP servers"),
             ("/plugins", "List and reload installed Python plugins"),
         ("/connect", "Open endpoint & provider landing setup"),
             ("/models", "Switch / discover available models from endpoint"),
@@ -2895,26 +3612,74 @@ class LocalAICLI:
             return None
         return actions[idx][0]
 
+    def _apply_provider_model(self, spec: str) -> str:
+        s = spec.strip()
+        if ":" in s and s.split(":", 1)[0].lower() in ("ollama", "gemini", "openrouter", "openai", "llamacpp", "lmstudio"):
+            prov, mod = s.split(":", 1)[0].lower(), s.split(":", 1)[1].strip()
+            preset = next((p for p in PROVIDER_PRESETS if p["id"] == prov), None)
+            self.config.provider = prov
+            self.config.model = mod
+            if preset:
+                self.config.base_url = preset["url"].rstrip("/")
+            if prov == "gemini" and os.environ.get("GEMINI_API_KEY"):
+                self.config.api_key = os.environ["GEMINI_API_KEY"]
+            elif prov in ("ollama", "llamacpp", "lmstudio"):
+                self.config.api_key = ""
+        else:
+            self.config.model = s
+        self.config.save()
+        return f"{self.config.provider}:{self.config.model}"
+
     def switch_model_picker(self) -> None:
-        _, discovered, _ = self._fetch_models_for(self.config.base_url, self.config.api_key)
-        options = [f"{m} {'(current)' if m == self.config.model else ''}".strip() for m in discovered]
-        options.append("+ Enter custom model name...")
+        entries: List[tuple[str, str]] = []
+        # 1. Local Ollama models
+        _, local_mods, _ = self._fetch_models_for("http://localhost:11434/v1", "")
+        for m in local_mods:
+            cur = " (current)" if (self.config.provider == "ollama" and self.config.model == m) else ""
+            entries.append((f"ollama:{m}", f"[ollama] {m}{cur}"))
+
+        # 2. Currently configured endpoint if not localhost Ollama
+        if self.config.base_url.rstrip("/") != "http://localhost:11434/v1":
+            _, cur_mods, _ = self._fetch_models_for(self.config.base_url, self.config.api_key)
+            for m in cur_mods:
+                cur = " (current)" if self.config.model == m else ""
+                entries.append((f"{self.config.provider}:{m}", f"[{self.config.provider}] {m}{cur}"))
+
+        # 3. Gemini API models (discovered if GEMINI_API_KEY is set, plus standard models)
+        gem_key = (self.config.api_key if self.config.provider == "gemini" else "") or os.environ.get("GEMINI_API_KEY", "")
+        gem_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        gem_mods: List[str] = []
+        if gem_key:
+            _, fetched_gem, _ = self._fetch_models_for(gem_url, gem_key)
+            gem_mods = [m.removeprefix("models/") for m in fetched_gem if "embedding" not in m]
+        for fallback_gm in ("gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+            if fallback_gm not in gem_mods:
+                gem_mods.append(fallback_gm)
+        for gm in gem_mods:
+            if not any(spec == f"gemini:{gm}" for spec, _ in entries):
+                cur = " (current)" if (self.config.provider == "gemini" and self.config.model == gm) else ""
+                entries.append((f"gemini:{gm}", f"[gemini] {gm}{cur}"))
+
+        options = [lbl for _, lbl in entries] + ["+ Enter custom provider:model (e.g. ollama:qwen3:8b or gemini:gemini-2.5-pro)..."]
         idx = self.select_menu(
-            f"Select Model ({self.config.provider} @ {self.config.base_url}):",
+            f"Select Active Model (current: {self.config.provider}:{self.config.model}):",
             options,
             header_fn=self.render_header,
         )
         if idx < 0:
             return
-        if idx < len(discovered):
-            self.config.model = discovered[idx]
+        if idx < len(entries):
+            spec, _ = entries[idx]
+            if spec.startswith("gemini:") and not gem_key:
+                entered_key = self._prompt_line_field("GEMINI_API_KEY", "", mask=True)
+                if entered_key:
+                    os.environ["GEMINI_API_KEY"] = entered_key
+                    self.config.api_key = entered_key
+            self._apply_provider_model(spec)
         else:
-            self.clear()
-            self.render_header()
-            val = input("Model name: ").strip()
+            val = self._prompt_line_field("Model (provider:model or model)", f"{self.config.provider}:{self.config.model}")
             if val:
-                self.config.model = val
-        self.config.save()
+                self._apply_provider_model(val)
 
     def switch_theme_picker(self) -> None:
         themes = load_themes()
@@ -3146,7 +3911,7 @@ class LocalAICLI:
             avail_ag = list(agents.keys()) or ["planner", "coder", "reviewer"]
             schema_hint = (
                 'Return ONLY valid JSON with keys: "name" (slug), "description" (1 line), '
-                '"steps" (list of {"agent": one of ' + json.dumps(avail_ag) + ', "instruction": "..."}).'
+                '"steps" (list of {"id": "step_id", "agent": one of ' + json.dumps(avail_ag) + ', "instruction": "...", "when": "", "on_pass": "", "on_fail": "", "max_retries": 0}).'
             )
 
         self.render_prompt_view("", 0)
@@ -3474,6 +4239,9 @@ class LocalAICLI:
         if cmd in ("/create", "/generate"):
             asyncio.run(self.ai_create_asset(text[len(cmd):].strip()))
             return True
+        if cmd == "/mcp":
+            self.active_tab = "mcp"
+            return True
         if cmd == "/plugins":
             PLUGIN_REGISTRY.reload(self.config.disabled_plugins)
             if not PLUGIN_REGISTRY.plugins:
@@ -3515,7 +4283,106 @@ class LocalAICLI:
             return True
         if cmd == "/copy":
             arg = text[len(cmd):].strip().lower()
-            self.copy_last_response(code_only=(arg in ("code", "block")))
+            if arg.isdigit():
+                self.copy_last_response(code_only=True, block_index=int(arg))
+            else:
+                self.copy_last_response(code_only=(arg in ("code", "blocks", "block")))
+            return True
+        if cmd == "/fork":
+            fork_name = text[len(cmd):].strip()
+            new_id = self.fork_current_session(fork_name)
+            self.chat_items.append(
+                f"[{self.colors['ok']}]Forked session -> [bold]{self.session_name}[/] ({new_id}) with {len(self.messages)} messages.[/]"
+            )
+            return True
+        if cmd == "/context":
+            total_tok = self.prompt_tokens + self.completion_tokens
+            ctx_cap = max(1, int(self.config.num_ctx))
+            pct = min(100, int((total_tok / ctx_cap) * 100))
+            sys_tok = len(self.messages[0]["content"]) // 4 if self.messages and self.messages[0].get("role") == "system" else 0
+            chat_tok = sum(len(str(m.get("content", ""))) // 4 for m in self.messages if m.get("role") in ("user", "assistant"))
+            tool_tok = sum(len(str(m.get("content", ""))) // 4 for m in self.messages if m.get("role") == "tool")
+            mem_chars = (len(GLOBAL_MEMORY_FILE.read_text()) if GLOBAL_MEMORY_FILE.exists() else 0) + (
+                len((Path.cwd() / "THULE.md").read_text()) if (Path.cwd() / "THULE.md").exists() else 0
+            )
+            bar_w = 28
+            filled = min(bar_w, int((total_tok / ctx_cap) * bar_w))
+            bar = ("█" * filled) + ("░" * (bar_w - filled))
+            self.chat_items.append(
+                f"[bold {self.colors['grad_start']}]Context Window Inspector[/]  [dim](session: {self.session_name} / {self.session_id})[/]\n"
+                f"  Usage:   [{self.colors['accent']}]{bar}[/] [bold]{total_tok:,}[/] / {ctx_cap:,} tok ({pct}%)\n"
+                f"  System:  ~{sys_tok:,} tok   |   Chat: ~{chat_tok:,} tok   |   Tool outputs: ~{tool_tok:,} tok\n"
+                f"  Memory:  {mem_chars:,} chars   |   Checkpoints: {len(self.checkpoints)}   |   Queued images: {len(self.pending_images)}"
+            )
+            return True
+        if cmd == "/memory":
+            arg = text[len(cmd):].strip()
+            local_mem = Path.cwd() / "THULE.md"
+            if arg.startswith("add "):
+                fact = arg[4:].strip()
+                if fact:
+                    GLOBAL_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    with open(GLOBAL_MEMORY_FILE, "a", encoding="utf-8") as mf:
+                        mf.write(f"\n- {fact}")
+                    self.chat_items.append(f"[{self.colors['ok']}]Saved to global memory ({GLOBAL_MEMORY_FILE}):[/] {fact}")
+                return True
+            if arg.startswith("local "):
+                fact = arg[6:].strip()
+                if fact:
+                    with open(local_mem, "a", encoding="utf-8") as mf:
+                        mf.write(f"\n- {fact}")
+                    self.chat_items.append(f"[{self.colors['ok']}]Saved to project memory ({local_mem}):[/] {fact}")
+                return True
+            if arg == "edit":
+                cur_txt = local_mem.read_text() if local_mem.exists() else "# Project Memory (THULE.md)\n"
+                edited = self.open_external_editor(cur_txt)
+                if edited:
+                    local_mem.write_text(edited + "\n")
+                    self.chat_items.append(f"[{self.colors['ok']}]Updated {local_mem}[/]")
+                return True
+            chunks = []
+            if GLOBAL_MEMORY_FILE.exists() and GLOBAL_MEMORY_FILE.read_text().strip():
+                chunks.append(f"[bold {self.colors['grad_start']}]Global Memory ({GLOBAL_MEMORY_FILE})[/]\n{GLOBAL_MEMORY_FILE.read_text().strip()}")
+            if local_mem.exists() and local_mem.read_text().strip():
+                chunks.append(f"[bold {self.colors['grad_end']}]Project Memory ({local_mem})[/]\n{local_mem.read_text().strip()}")
+            if not chunks:
+                self.chat_items.append("[dim]No memory recorded yet. Use `/memory add <fact>`, `/memory local <fact>`, or `/memory edit`.[/]")
+            else:
+                self.chat_items.append("\n\n".join(chunks))
+            return True
+        if cmd == "/permissions":
+            arg = text[len(cmd):].strip().lower()
+            modes = ["ask", "auto-edit", "yolo"]
+            if arg in modes:
+                self.config.permission_mode = arg
+                self.config.auto_approve = arg in ("auto-edit", "yolo")
+                self.config.save()
+                self.chat_items.append(f"[{self.colors['ok']}]Permission mode set to: [bold]{arg.upper()}[/][/]")
+                return True
+            if arg == "reset":
+                self.config.always_allow.clear()
+                self.config.permission_mode = "ask"
+                self.config.auto_approve = False
+                self.config.save()
+                self.chat_items.append(f"[{self.colors['warn']}]Reset permission mode to ASK and cleared always-allow rules.[/]")
+                return True
+            opts = [
+                f"1. ask        — Prompt before edits & shell commands {'(current)' if self.config.permission_mode == 'ask' else ''}",
+                f"2. auto-edit  — Auto-approve file edits; prompt on shell {'(current)' if self.config.permission_mode == 'auto-edit' else ''}",
+                f"3. yolo       — Auto-approve all file edits & shell commands {'(current)' if self.config.permission_mode == 'yolo' else ''}",
+                f"4. Clear {len(self.config.always_allow)} persisted always-allow rule(s)",
+            ]
+            pick = self.select_menu("Permission Policy (/permissions):", opts, header_fn=self.render_header)
+            if 0 <= pick <= 2:
+                chosen_m = modes[pick]
+                self.config.permission_mode = chosen_m
+                self.config.auto_approve = chosen_m in ("auto-edit", "yolo")
+                self.config.save()
+                self.chat_items.append(f"[{self.colors['ok']}]Permission mode: [bold]{chosen_m.upper()}[/][/]")
+            elif pick == 3:
+                self.config.always_allow.clear()
+                self.config.save()
+                self.chat_items.append(f"[{self.colors['warn']}]Cleared always-allow rules.[/]")
             return True
         if cmd == "/mode":
             self.config.execution_mode = "plan" if self.config.execution_mode == "build" else "build"
@@ -3573,11 +4440,66 @@ class LocalAICLI:
         if cmd == "/help":
             self.show_help_modal()
             return True
-        if cmd == "/models":
-            self.switch_model_picker()
+        if cmd == "/paste":
+            pasted = _try_paste_clipboard_image()
+            if pasted:
+                img_path = Path(pasted[6:].strip().lstrip("@"))
+                if img_path.is_file():
+                    b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
+                    mime = "image/jpeg" if img_path.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                    self.pending_images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                    self.chat_items.append(
+                        f"[{self.colors['ok']}]Attached screenshot {img_path.name} ({len(self.pending_images)} image(s) queued for next prompt).[/]"
+                    )
+            else:
+                self.chat_items.append(f"[{self.colors['warn']}]No image found on clipboard.[/]")
             return True
-        if cmd in ("/sessions", "/resume"):
-            self.browse_sessions()
+        if cmd in ("/models", "/model"):
+            arg_m = text[len(cmd):].strip()
+            if arg_m:
+                applied = self._apply_provider_model(arg_m)
+                self.chat_items.append(f"[{self.colors['ok']}]Active model switched to [bold]{applied}[/][/]")
+            else:
+                self.switch_model_picker()
+            return True
+        if cmd in ("/sessions", "/resume", "/session"):
+            sub_raw = text[len(cmd):].strip()
+            if not sub_raw:
+                self.browse_sessions()
+                return True
+            sub_parts = sub_raw.split(None, 1)
+            sub = sub_parts[0].lower()
+            sarg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+            if sub == "new":
+                self.save_session()
+                self.chat_items.clear()
+                self.messages.clear()
+                self.checkpoints.clear()
+                self.scroll_offset = 0
+                self.session_id = datetime.now().strftime("session-%Y%m%d-%H%M%S")
+                self.session_name = sarg or "session"
+                self.chat_items.append(f"[{self.colors['ok']}]Started new session: [bold]{self.session_name}[/] ({self.session_id})[/]")
+            elif sub == "rename" and sarg:
+                self.session_name = sarg
+                self.save_session()
+                self.chat_items.append(f"[{self.colors['ok']}]Renamed session to [bold]{sarg}[/].[/]")
+            elif sub == "fork":
+                nid = self.fork_current_session(sarg)
+                self.chat_items.append(f"[{self.colors['ok']}]Forked session -> [bold]{self.session_name}[/] ({nid})[/]")
+            elif sub == "delete" and sarg:
+                deleted = 0
+                for f in SESSIONS_DIR.glob("*.json"):
+                    if f.stem == sarg or sarg in f.stem:
+                        f.unlink(missing_ok=True)
+                        deleted += 1
+                self.chat_items.append(f"[{self.colors['warn']}]Deleted {deleted} session file(s) matching '{sarg}'.[/]")
+            elif sub in ("load", "resume") and sarg:
+                if self.load_session_by_id(sarg):
+                    self.chat_items.append(f"[{self.colors['ok']}]Resumed session {self.session_id}.[/]")
+                else:
+                    self.chat_items.append(f"[{self.colors['err']}]Session '{sarg}' not found.[/]")
+            else:
+                self.browse_sessions()
             return True
         if cmd == "/theme":
             self.switch_theme_picker()
@@ -3647,6 +4569,67 @@ class LocalAICLI:
                 self.render_prompt_view("", 0)
                 asyncio.run(self._run_prompt_interruptible(draft))
             return True
+        if cname == "skill":
+            parts_sk = text.split(None, 2)
+            sub_sk = parts_sk[1].lower() if len(parts_sk) > 1 else "list"
+            arg_sk = parts_sk[2].strip() if len(parts_sk) > 2 else ""
+            smap = load_skills()
+            if sub_sk == "create" and arg_sk:
+                slug = re.sub(r"[^a-z0-9-]+", "-", arg_sk.lower()).strip("-")
+                sdir = Path.cwd() / "skills" / slug
+                (sdir / "references").mkdir(parents=True, exist_ok=True)
+                (sdir / "scripts").mkdir(parents=True, exist_ok=True)
+                sfile = sdir / "SKILL.md"
+                if not sfile.exists():
+                    sfile.write_text(
+                        f"---\nname: {slug}\ndescription: Describe when Thule should use {slug}.\nargument-hint: \"[target]\"\n---\n\nInstructions for {slug}. Target: `$ARGUMENTS`\n",
+                        encoding="utf-8",
+                    )
+                self.chat_items.append(f"[{self.colors['ok']}]Created Claude-compatible skill:[/] {sfile}")
+                return True
+            if sub_sk == "info" and arg_sk in smap:
+                sk = smap[arg_sk]
+                self.chat_items.append(
+                    f"[bold]{sk.name}[/] ({sk.path})\nDescription: {sk.description}\nContext: {sk.context_mode} | User-invocable: {sk.user_invocable} | Resources: {', '.join(sk.resources) or 'none'}"
+                )
+                return True
+            lines_sk = [f"[bold]Loaded Agent Skills ({len(smap)}):[/]"]
+            for sk in sorted(smap.values(), key=lambda x: x.name):
+                res_tag = f" [dim](+{len(sk.resources)} files)[/]" if sk.resources else ""
+                lines_sk.append(f"  [bold]/{sk.name}[/]{res_tag} — {sk.description[:95]}")
+            self.chat_items.append("\n".join(lines_sk))
+            return True
+
+        _smap = load_skills()
+        if cname in _smap and _smap[cname].user_invocable:
+            sk = _smap[cname]
+            arg_str = text[len(cmd):].strip()
+            rendered = render_skill_body(sk, arg_str, session_id=self.session_id, allow_shell=self.config.auto_approve)
+            res_hint = f"\n\nSkill base directory: `{sk.base_dir}` (resources: {', '.join(sk.resources)})" if sk.resources else ""
+            if self.chat_items:
+                self.chat_items.append(Rule(style="dim"))
+            self.chat_items.append(f"[{self.colors['grad_start']}]>[/] /{cname} {arg_str}".strip())
+            self.render_prompt_view("", 0)
+            prompt_payload = f"[Invoked Skill: @{sk.name}]\n{rendered}{res_hint}"
+            if sk.context_mode == "fork":
+                agents, _ = load_agents_and_workflows()
+                sub_ag = agents.get(sk.subagent_type) or agents.get("reviewer") or AgentDef(
+                    name=sk.subagent_type, description=sk.description, system_prompt="You are a focused subagent."
+                )
+                if sk.model_override:
+                    sub_ag = AgentDef(**{**asdict(sub_ag), "model": sk.model_override})
+                sub_convo = [
+                    {"role": "system", "content": self.build_system_prompt(sub_ag, [])},
+                    {"role": "user", "content": prompt_payload},
+                ]
+                res_out = asyncio.run(self.run_single_agent(sub_ag, sub_convo, label=f"skill:{sk.name}"))
+                self.messages.append({"role": "user", "content": f"/{cname} {arg_str}".strip()})
+                self.messages.append({"role": "assistant", "content": res_out})
+            else:
+                asyncio.run(self._run_prompt_interruptible(prompt_payload))
+            self.save_session()
+            return True
+
         custom_cmds = load_custom_commands()
         cname = cmd.lstrip("/")
         if cname in custom_cmds:
@@ -3667,6 +4650,7 @@ class LocalAICLI:
     SLASH_COMMANDS: List[tuple[str, str]] = [
         ("/help", "Show all slash commands & keybindings"),
         ("/docs", "Read Thule documentation (agents, themes, workflows, plugins, etc.)"),
+        ("/mcp", "Open MCP Servers tab (Obsidian, Roblox, stdio JSON-RPC tools)"),
         ("/create", "AI-generate a workflow, agent, theme, or plugin"),
         ("/generate", "Alias for /create (workflow, agent, theme, plugin)"),
         ("/connect", "Open endpoint & provider landing setup"),
@@ -3675,8 +4659,13 @@ class LocalAICLI:
         ("/git", "View git status & recent commits"),
         ("/commit", "Generate AI commit message & commit changes"),
         ("/map", "Show compact repository file & symbol map"),
-        ("/copy", "Copy last assistant response to clipboard"),
-        ("/sessions", "Browse and resume saved sessions"),
+        ("/copy", "Code Block Copy Selector & response copier (/copy [code|<n>])"),
+        ("/fork", "Fork current conversation into a new independent session"),
+        ("/context", "Inspect token usage, context window budget & attachments"),
+        ("/memory", "View or add persistent global/project memory (/memory add|local)"),
+        ("/permissions", "Manage tool approval policy (ask / auto-edit / yolo)"),
+        ("/paste", "Paste screenshot/image from clipboard into next prompt"),
+        ("/sessions", "Manage sessions (browse, new, rename, fork, delete)"),
         ("/new", "Start a new clean session"),
         ("/undo", "Undo the last prompt & assistant response"),
         ("/compact", "Summarize older turns to compact context"),
@@ -3702,7 +4691,12 @@ class LocalAICLI:
             ("/nudge", "Halt AI mid-thought, ask it to second-guess itself, and continue"),
         ]
         plugin_cmds = [(k, v.description[:75]) for k, v in PLUGIN_REGISTRY.commands.items()]
-        custom = [(f"/{k}", v.splitlines()[0][:55]) for k, v in load_custom_commands().items()] + plugin_cmds + [("/plugins", "List and reload installed Python plugins")]
+        skill_cmds = [
+            (f"/{s.name}", f"[skill] {s.argument_hint + ' — ' if s.argument_hint else ''}{s.description[:75]}")
+            for s in sorted(load_skills().values(), key=lambda x: x.name)
+            if s.user_invocable
+        ]
+        custom = [(f"/{k}", v.splitlines()[0][:55]) for k, v in load_custom_commands().items()] + skill_cmds + plugin_cmds + [("/skill", "Manage Agent Skills (list, info, create)"), ("/plugins", "List and reload installed Python plugins")]
         seen = set()
         merged: List[tuple[str, str]] = []
         for item in extra + self.SLASH_COMMANDS + custom:
@@ -3888,6 +4882,8 @@ class LocalAICLI:
             self.chat_items[-1]["items"].append((target, failed, detail))
         else:
             self.chat_items.append(entry)
+        if getattr(self, "active_tab", "") == "prompt" and getattr(self, "_active_spinners", None):
+            self._render_active_spinners()
 
     def _render_tool_activity_entry(self, entry: dict) -> Any:
         verb = entry.get("verb", "Ran")
@@ -4131,6 +5127,13 @@ class LocalAICLI:
                 sys.stdout.flush()
                 self.render_prompt_view(buf, cursor)
                 continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                continue
             prev_buf = buf
             if key == "LEFT":
                 if buf == "":
@@ -4315,8 +5318,18 @@ class LocalAICLI:
                     self._update_input(prev_buf, buf, cursor)
             elif key.startswith("PASTE:"):
                 clip_txt = key[6:].replace("\r\n", "\n").replace("\r", "\n")
+                if clip_txt.startswith("@") and any(clip_txt.strip().lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp")):
+                    img_p = Path(clip_txt.strip().lstrip("@"))
+                    if img_p.is_file():
+                        b64 = base64.b64encode(img_p.read_bytes()).decode("ascii")
+                        mime = "image/jpeg" if img_p.suffix.lower() in (".jpg", ".jpeg") else "image/png"
+                        self.pending_images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                        self.chat_items.append(f"[{self.colors['ok']}]Pasted screenshot: {img_p.name} ({len(self.pending_images)} queued)[/]")
+                        self.render_prompt_view(buf, cursor)
+                        continue
                 buf = buf[:cursor] + clip_txt + buf[cursor:]
                 cursor += len(clip_txt)
+                self._update_input(prev_buf, buf, cursor)
             elif len(key) == 1 and key.isprintable():
                 buf = buf[:cursor] + key + buf[cursor:]
                 cursor += 1
@@ -4369,6 +5382,13 @@ class LocalAICLI:
             if (cur_dir / ".git").exists() or cur_dir == home_dir or cur_dir.parent == cur_dir:
                 break
             cur_dir = cur_dir.parent
+        if GLOBAL_MEMORY_FILE.is_file():
+            try:
+                gmem = GLOBAL_MEMORY_FILE.read_text()[:4000].strip()
+                if gmem:
+                    parts.append(f"\n--- GLOBAL USER MEMORY ({GLOBAL_MEMORY_FILE}) ---\n{gmem}")
+            except Exception:
+                pass
         for d in reversed(walk_dirs):
             for candidate in (d / "THULE.md", d / ".thule" / "instructions.md", d / "AGENTS.md"):
                 if candidate.is_file():
@@ -4384,14 +5404,21 @@ class LocalAICLI:
         if combined_skill_names:
             parts.append("\n--- ACTIVE SKILLS ---")
             for sname in combined_skill_names:
-                parts.append(f"\n[{sname}]\n{all_skills[sname]}")
+                sk = all_skills[sname]
+                rendered_sk = render_skill_body(sk, session_id=self.session_id, allow_shell=self.config.auto_approve)
+                res_note = f"\nAvailable resources (via `get_skill_resource`): {', '.join(sk.resources)}" if sk.resources else ""
+                parts.append(f"\n[{sk.name}]\n{rendered_sk}{res_note}")
         if self.config.auto_docs_skills:
-            avail_names = sorted(all_skills.keys())
+            catalog = [
+                s for s in sorted(all_skills.values(), key=lambda x: x.name)
+                if not s.disable_model_invocation and s.name not in combined_skill_names
+            ]
+            catalog_lines = "\n".join(f"  * {s.name}: {s.full_trigger_description}" for s in catalog) if catalog else "  * (no additional skills)"
             parts.append(
-                "\n--- ON-DEMAND DOCS & SKILLS LOOKUP (ENABLED) ---\n"
-                "You can check back at documentation and skills at any point mid-task before acting:\n"
-                "- Call `get_documentation(topic=...)` for: agents, themes, workflows, plugins, hooks, commands, skills, configuration, all.\n"
-                f"- Call `get_skill(name=...)` to inspect or load any available skill: {', '.join(avail_names) if avail_names else '(none)'}."
+                "\n--- ON-DEMAND DOCS & SKILLS (PROGRESSIVE DISCLOSURE) ---\n"
+                "When a user's request matches a skill below, call `get_skill(name='<slug>')` FIRST before acting:\n"
+                f"{catalog_lines}\n"
+                "- Call `get_documentation(topic=...)` for Thule specs: agents, themes, workflows, plugins, hooks, commands, skills, configuration."
             )
         return "\n".join(parts)
 
@@ -4447,13 +5474,21 @@ class LocalAICLI:
 
         if attached_files:
             text = f"{text}\n\n" + "\n\n".join(attached_files)
+            for s_slug, s_def in available_skills.items():
+                if s_def.paths_glob and s_slug not in found_skills:
+                    for raw_tok in re.findall(r"@([a-zA-Z0-9_./-]+)", text):
+                        if any(fnmatch.fnmatch(raw_tok, pat) for pat in s_def.paths_glob):
+                            found_skills.append(s_slug)
+                            break
         return text, found_skills, attached_images
 
     # --------------------------------------------------------------------------
     # 5. TOOL APPROVAL & EXECUTION (FILES, SEARCH, DIFFS, SHELL)
     # --------------------------------------------------------------------------
     def ask_approval(self, label: str, allow_key: str, force_manual: bool = False) -> str:
-        if not force_manual and (self.config.auto_approve or allow_key in self.config.always_allow):
+        if self.config.permission_mode == "yolo":
+            return "auto"
+        if not force_manual and (self.config.auto_approve or self.config.permission_mode == "auto-edit" or allow_key in self.config.always_allow):
             return "auto"
 
         options = (
@@ -4561,6 +5596,23 @@ class LocalAICLI:
             capture_output=True,
         )
 
+
+    async def execute_shell(self, cmd: str) -> str:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            cwd=str(Path.cwd()),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=float(self.config.command_timeout))
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return f"Error: command timed out after {self.config.command_timeout}s"
+        combined = (out_b.decode(errors="replace") + err_b.decode(errors="replace")).strip()
+        return self._truncate_head_tail(combined) if combined else f"(exit code {proc.returncode})"
+
     async def run_tool_call(self, fn_name: str, args: Dict[str, Any], agent_label: str) -> str:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ignore_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", "target", "dist", "build"}
@@ -4653,7 +5705,7 @@ class LocalAICLI:
             return tool_result
         if fn_name == "read_file":
             rel = args.get("path", "")
-            fp, _allowed_ws = self._resolve_workspace_path(rel, "edit")
+            fp, _allowed_ws = self._resolve_workspace_path(rel, "read")
             if not _allowed_ws:
                 return f"Blocked: user denied edit outside workspace ({rel})."
             if not fp.is_file():
@@ -4664,6 +5716,87 @@ class LocalAICLI:
             numbered = [f"{i:>4} | {lines[i - 1]}" for i in range(start, end + 1)]
             self.chat_items.append(f"[dim]read {rel} ({start}-{end}/{len(lines)})[/]")
             return "\n".join(numbered) or "(empty file)"
+
+        if fn_name == "ask_user":
+            question = str(args.get("question", "")).strip()
+            options = [str(o) for o in (args.get("options") or []) if str(o).strip()]
+            if not question:
+                return "Error: empty question."
+            self._pause_esc_watcher = True
+            saved_spinners = list(getattr(self, "_active_spinners", []))
+            self._active_spinners.clear()
+            try:
+                if options:
+                    menu_opts = options + ["+ Type custom answer..."]
+                    pick = self.select_menu(f"Agent Question: {question}", menu_opts, header_fn=self.render_header)
+                    if 0 <= pick < len(options):
+                        answer = options[pick]
+                    elif pick == len(options):
+                        self.clear()
+                        self.render_header()
+                        answer = self._prompt_line_field("Answer", "")
+                    else:
+                        answer = "(user dismissed prompt)"
+                else:
+                    self.clear()
+                    self.render_header()
+                    self.console.print(f"\n[bold {self.colors['accent']}]Agent Question:[/] {question}\n")
+                    answer = self._prompt_line_field("Answer", "")
+            finally:
+                self._active_spinners.extend(saved_spinners)
+                self._pause_esc_watcher = False
+                if self.active_tab == "prompt":
+                    self.render_prompt_view("", 0)
+            self.chat_items.append(f"[bold {self.colors['accent']}][?] {question}[/] -> [bold]{answer}[/]")
+            return f"User answered: {answer}"
+
+        if fn_name == "fuzzy_edit_file":
+            rel = args.get("path", "")
+            target_blk = args.get("target", "")
+            replacement_blk = args.get("replacement", "")
+            threshold = float(args.get("threshold") or 0.78)
+            fp, _allowed_ws = self._resolve_workspace_path(rel, "write")
+            if not _allowed_ws:
+                return f"Blocked: user denied write outside workspace ({rel})."
+            if not fp.is_file():
+                return f"File not found: {rel}"
+            current = fp.read_text(errors="replace")
+            if target_blk in current:
+                updated = current.replace(target_blk, replacement_blk, 1)
+                match_note = "exact match"
+            else:
+                c_lines = current.splitlines(keepends=True)
+                t_lines = target_blk.splitlines(keepends=True)
+                win = len(t_lines)
+                if win == 0 or win > len(c_lines):
+                    return f"Fuzzy match failed in {rel}: target block line count ({win}) out of range."
+                t_norm = "\n".join(ln.strip() for ln in t_lines)
+                best_ratio, best_idx = 0.0, -1
+                for i in range(len(c_lines) - win + 1):
+                    cand_norm = "\n".join(ln.strip() for ln in c_lines[i : i + win])
+                    ratio = difflib.SequenceMatcher(None, t_norm, cand_norm).ratio()
+                    if ratio > best_ratio:
+                        best_ratio, best_idx = ratio, i
+                if best_ratio < threshold:
+                    return f"Fuzzy match failed in {rel} (best similarity {best_ratio:.2f} < {threshold:.2f})."
+                r_lines = replacement_blk.splitlines(keepends=True)
+                if r_lines and not r_lines[-1].endswith("\n") and c_lines[best_idx + win - 1].endswith("\n"):
+                    r_lines[-1] += "\n"
+                updated = "".join(c_lines[:best_idx] + r_lines + c_lines[best_idx + win :])
+                match_note = f"fuzzy ratio={best_ratio:.2f} at line {best_idx + 1}"
+
+            diff_str = format_unified_diff(current, updated, rel)
+            decision = self.ask_approval(f"fuzzy_edit_file ({match_note}): {rel}", "edit_file")
+            if decision == "deny":
+                self.chat_items.append(f"[{self.colors['err']}]denied fuzzy edit: {rel}[/]")
+                return "User denied file edit."
+            self.record_checkpoint(rel, True, current)
+            fp.write_text(updated)
+            self._maybe_auto_commit(rel, "fuzzy-edit")
+            self.chat_items.append(f"[{self.colors['ok']}]fuzzy-edited {rel}[/] [dim]({match_note})[/]\n{diff_str}")
+            append_history({"time": ts, "agent": agent_label, "status": "APPROVED", "cmd": f"fuzzy_edit {rel}", "out": ""})
+            run_lifecycle_hooks("PostToolUse", {"tool_name": "fuzzy_edit_file", "path": rel})
+            return f"Successfully fuzzy-edited {rel} ({match_note})."
 
         if fn_name == "edit_file":
             rel = args.get("path", "")
@@ -4807,7 +5940,13 @@ class LocalAICLI:
         if fn_name == "create_workflow":
             slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(args.get("name", "custom-workflow"))).strip("-").lower() or "custom-workflow"
             steps = [
-                WorkflowStep(agent=str(s.get("agent", "default")), instruction=str(s.get("instruction", "")))
+                WorkflowStep(
+                    id=str(s.get("id", "")),
+                    agent=str(s.get("agent", "default")),
+                    instruction=str(s.get("instruction") or s.get("prompt_template") or ""),
+                    provider=str(s.get("provider", "")),
+                    model=str(s.get("model", "")),
+                )
                 for s in (args.get("steps") or [])
                 if isinstance(s, dict)
             ]
@@ -4832,22 +5971,47 @@ class LocalAICLI:
             skills_map = load_skills()
             req_name = str(args.get("name", "")).strip().lstrip("@").lower()
             if not req_name or req_name in ("list", "all", "*"):
-                if not skills_map:
-                    return "No skills found in Skills/ directories."
-                listing = []
-                for s_slug, s_body in sorted(skills_map.items()):
-                    first_line = next((ln.lstrip("# ").strip() for ln in s_body.splitlines() if ln.strip()), "")
-                    listing.append(f"- {s_slug}: {first_line[:90]}")
-                self.chat_items.append(f"[dim]listed skills ({len(skills_map)})[/]")
-                return "Available skills (call get_skill(name='<slug>') to read full instructions):\n" + "\n".join(listing)
-            if req_name in skills_map:
-                self.chat_items.append(f"[dim]checked skill: @{req_name}[/]")
-                return f"--- Skill: @{req_name} ---\n{skills_map[req_name]}"
-            matches = [k for k in skills_map if req_name in k]
-            if len(matches) == 1:
-                self.chat_items.append(f"[dim]checked skill: @{matches[0]}[/]")
-                return f"--- Skill: @{matches[0]} ---\n{skills_map[matches[0]]}"
-            return f"Skill '{req_name}' not found. Available skills: {', '.join(sorted(skills_map.keys())) or 'none'}"
+                invocable = [s for s in skills_map.values() if not s.disable_model_invocation]
+                if not invocable:
+                    return "No model-invocable skills found."
+                listing = [f"- {s.name}: {s.full_trigger_description}" for s in sorted(invocable, key=lambda x: x.name)]
+                self.chat_items.append(f"[dim]listed skills ({len(invocable)})[/]")
+                return "Available skills (call get_skill(name='<slug>') to activate):\n" + "\n".join(listing)
+            sk = skills_map.get(req_name)
+            if not sk:
+                matches = [k for k in skills_map if req_name in k]
+                if len(matches) == 1:
+                    sk = skills_map[matches[0]]
+            if not sk:
+                return f"Skill '{req_name}' not found. Available: {', '.join(sorted(skills_map.keys())) or 'none'}"
+            self.chat_items.append(f"[dim]loaded skill: @{sk.name}[/]")
+            rendered = render_skill_body(sk, session_id=self.session_id, allow_shell=self.config.auto_approve)
+            out = [f"--- Skill: @{sk.name} ---"]
+            if sk.base_dir:
+                out.append(f"Base directory: {sk.base_dir}")
+            if sk.allowed_tools:
+                out.append(f"Preferred tools: {', '.join(sk.allowed_tools)}")
+            out.append("\n" + rendered)
+            if sk.resources:
+                out.append("\n### Supplementary Skill Resources (call get_skill_resource to read)")
+                out.extend(f"- {r}" for r in sk.resources[:30])
+            return "\n".join(out)
+
+        if fn_name == "get_skill_resource":
+            if not self.config.auto_docs_skills:
+                return "Blocked: On-demand docs & skills lookup is toggled OFF (/ref or Settings)."
+            skills_map = load_skills()
+            sname = str(args.get("skill_name", "")).strip().lstrip("@").lower()
+            rel_res = str(args.get("resource_path", "")).strip()
+            sk = skills_map.get(sname)
+            if not sk or not sk.base_dir:
+                return f"Skill '{sname}' not found or has no resource directory."
+            target_res = (sk.base_dir / rel_res).resolve()
+            if sk.base_dir.resolve() not in target_res.parents or not target_res.is_file():
+                return f"Resource '{rel_res}' not found inside skill '{sname}'."
+            self.chat_items.append(f"[dim]read skill resource: @{sname}/{rel_res}[/]")
+            return target_res.read_text(errors="replace")[:24000]
+
 
         if fn_name == "create_theme":
             slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(args.get("name", "custom-theme"))).strip("-").lower() or "custom-theme"
@@ -4901,7 +6065,27 @@ class LocalAICLI:
             except Exception as exc:
                 return f"Plugin tool '{fn_name}' error: {exc}"
 
-        return f"Unknown tool: {fn_name}"
+        if MCP_MANAGER.has_tool(fn_name):
+            sname = MCP_MANAGER.server_for_tool(fn_name) or "mcp"
+            allow_key = f"mcp:{sname}"
+            arg_preview = json.dumps(args)[:120]
+            decision = self.ask_approval(f"{fn_name}({arg_preview})", allow_key)
+            if decision == "deny":
+                self._append_tool_activity("Ran", fn_name, failed=True)
+                append_history({"time": ts, "agent": agent_label, "status": "DENIED", "cmd": f"{fn_name} {arg_preview}", "out": ""})
+                return f"User denied MCP tool '{fn_name}'."
+            out = await MCP_MANAGER.call_tool(fn_name, args)
+            failed = out.startswith(("Error:", "MCP Tool Error:", "MCP Call Failed", "MCP Tool Reported Error:"))
+            self._append_tool_activity("Ran", fn_name, failed=failed, detail=out)
+            status = "AUTO" if decision == "auto" else "APPROVED"
+            append_history({"time": ts, "agent": agent_label, "status": status, "cmd": f"{fn_name} {arg_preview}", "out": out[:500]})
+            run_lifecycle_hooks("PostToolUse", {"tool_name": fn_name, "server": sname})
+            return self._truncate_head_tail(out)
+
+        known_tools = [t["function"]["name"] for t in get_all_tool_definitions()]
+        close = difflib.get_close_matches(fn_name, known_tools, n=3, cutoff=0.55)
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        return f"Unknown tool: {fn_name}.{hint}"
 
     # --------------------------------------------------------------------------
     # 6. AGENT & WORKFLOW STREAMING EXECUTION ENGINE
@@ -4914,6 +6098,9 @@ class LocalAICLI:
         if prompt_hook_out:
             user_text = f"{user_text}\n\n[Hook Context]\n{prompt_hook_out}"
         clean_text, inline_skills, attached_images = self.resolve_mentions(user_text)
+        if self.pending_images:
+            attached_images.extend(self.pending_images)
+            self.pending_images.clear()
         agents, workflows = load_agents_and_workflows()
 
         if self.config.active_mode == "workflow":
@@ -4927,30 +6114,117 @@ class LocalAICLI:
             self.chat_items.append(
                 f"[{self.colors['grad_start']}]running workflow:[/] [bold]{wf.name}[/] ({len(wf.steps)} steps)"
             )
+            step_outputs: Dict[str, str] = {}
+            prev_output = ""
             accumulated_context = f"Original User Goal:\n{clean_text}"
 
-            for idx, step in enumerate(wf.steps, 1):
-                agent = agents.get(step.agent) or agents.get("default") or AgentDef(
+            def _render_tpl(text: str) -> str:
+                out = text.replace("{{goal}}", clean_text).replace("{{prev}}", prev_output)
+                for sid, sval in step_outputs.items():
+                    out = out.replace(f"{{{{steps.{sid}}}}}", sval)
+                return out
+
+            def _eval_when(expr: str) -> bool:
+                cond = _render_tpl(expr).strip()
+                if not cond:
+                    return True
+                neg = cond.startswith("!")
+                if neg:
+                    cond = cond[1:].strip()
+                res = True
+                if cond.startswith("contains:"):
+                    needle = cond.split(":", 1)[1].strip()
+                    res = needle.lower() in prev_output.lower()
+                elif cond.startswith("regex:"):
+                    pat = cond.split(":", 1)[1].strip()
+                    res = bool(re.search(pat, prev_output, re.IGNORECASE | re.MULTILINE))
+                elif cond.startswith("equals:"):
+                    val = cond.split(":", 1)[1].strip()
+                    res = prev_output.strip().lower() == val.lower()
+                else:
+                    res = cond.lower() in prev_output.lower()
+                return (not res) if neg else res
+
+            id_to_idx = {(st.id or f"step_{i+1}"): i for i, st in enumerate(wf.steps)}
+            visit_counts: Dict[int, int] = {}
+            cur = 0
+            exec_num = 0
+            max_hops = max(12, len(wf.steps) * 4)
+
+            while 0 <= cur < len(wf.steps) and exec_num < max_hops:
+                step = wf.steps[cur]
+                step_id = step.id or f"step_{cur + 1}"
+                if step.when and not _eval_when(step.when):
+                    self.chat_items.append(
+                        f"[dim][skip {cur + 1}/{len(wf.steps)} ({step_id}) — condition '{step.when}' false][/]"
+                    )
+                    cur += 1
+                    continue
+
+                exec_num += 1
+                visit_counts[cur] = visit_counts.get(cur, 0) + 1
+                base_agent = agents.get(step.agent) or agents.get("default") or AgentDef(
                     name=step.agent,
                     description="",
                     system_prompt="You are a helpful local assistant.",
                 )
+                step_prov = (step.provider or "").strip().lower()
+                step_mod = (step.model or "").strip()
+                if ":" in step_mod and step_mod.split(":", 1)[0].lower() in ("ollama", "gemini", "openrouter", "openai", "llamacpp", "lmstudio"):
+                    step_prov, step_mod = step_mod.split(":", 1)[0].lower(), step_mod.split(":", 1)[1].strip()
+                if step_prov or step_mod or step.base_url or step.api_key:
+                    agent = AgentDef(
+                        name=base_agent.name,
+                        description=base_agent.description,
+                        system_prompt=base_agent.system_prompt,
+                        provider=step_prov or base_agent.provider,
+                        base_url=(step.base_url or "").strip() or base_agent.base_url,
+                        api_key=(step.api_key or "").strip() or base_agent.api_key,
+                        model=step_mod or base_agent.model,
+                        skills=list(base_agent.skills),
+                    )
+                else:
+                    agent = base_agent
                 prov, _, _, mod = self.resolve_endpoint(agent)
+                rendered_instr = _render_tpl(step.instruction)
                 self.chat_items.append(
-                    f"\n[bold {self.colors['warn']}][step {idx}/{len(wf.steps)} -> {agent.name} ({prov}:{mod})][/] "
-                    f"[dim]{step.instruction}[/]"
+                    f"\n[bold {self.colors['warn']}][step {cur + 1}/{len(wf.steps)} '{step_id}' -> {agent.name} ({prov}:{mod})][/] "
+                    f"[dim]{rendered_instr}[/]"
                 )
                 step_prompt = (
                     f"{accumulated_context}\n\n"
-                    f"--- YOUR STEP ({idx}/{len(wf.steps)} as '{agent.name}') ---\n"
-                    f"{step.instruction}"
+                    f"--- YOUR STEP ('{step_id}' as '{agent.name}') ---\n"
+                    f"{rendered_instr}"
                 )
                 step_messages = [
                     {"role": "system", "content": self.build_system_prompt(agent, inline_skills)},
                     {"role": "user", "content": step_prompt},
                 ]
                 step_output = await self.run_single_agent(agent, step_messages, label=agent.name)
-                accumulated_context += f"\n\n--- Output from Step {idx} ({agent.name}) ---\n{step_output}"
+                prev_output = step_output
+                step_outputs[step_id] = step_output
+                accumulated_context += f"\n\n--- Output from Step '{step_id}' ({agent.name}) ---\n{step_output}"
+
+                failed = bool(re.search(r"\b(FAIL|FAILED|ERROR)\b", step_output))
+                target = (step.on_fail if failed else step.on_pass) or step.next
+                if target:
+                    if target.lower() == "end":
+                        break
+                    if target in id_to_idx:
+                        nxt = id_to_idx[target]
+                        limit = max(0, int(step.max_retries or 0))
+                        if nxt <= cur and visit_counts.get(nxt, 0) > limit:
+                            self.chat_items.append(
+                                f"[{self.colors['warn']}]Max retries ({limit}) reached for '{target}', advancing.[/]"
+                            )
+                            cur += 1
+                        else:
+                            self.chat_items.append(
+                                f"[dim][branch -> '{target}' ({'on_fail' if failed and step.on_fail else 'next'})][/]"
+                            )
+                            cur = nxt
+                        continue
+                cur += 1
         else:
             agent = agents.get(self.config.active_name) or agents.get("default") or AgentDef(
                 name="default",
@@ -5420,6 +6694,13 @@ class LocalAICLI:
         try:
             _set_raw_keep_opost()
             was_paused = False
+            watch_start = time.monotonic()
+            # Drain any residual escape/paste bytes already queued before watcher started
+            while True:
+                r_pre, _, _ = select.select([fd], [], [], 0.0)
+                if not r_pre:
+                    break
+                os.read(fd, 256)
             while not cancel_event.is_set() and not target_task.done():
                 if self._pause_esc_watcher:
                     if not was_paused:
@@ -5443,7 +6724,7 @@ class LocalAICLI:
                         await asyncio.sleep(0.01)
                         continue
 
-                    if key in ("ESC", "CTRL_C"):
+                    if key == "CTRL_C" or (key == "ESC" and (time.monotonic() - watch_start) >= 0.15):
                         cancel_event.set()
                         target_task.cancel()
                         return
@@ -5546,6 +6827,7 @@ class LocalAICLI:
                 pass
 
     async def _run_prompt_interruptible(self, user_text: str, is_continuation: bool = False) -> None:
+        turn_t0 = time.monotonic()
         self._live_buf = ""
         self._live_cursor = 0
         self._queued_live_inputs: List[str] = []
@@ -5619,6 +6901,8 @@ class LocalAICLI:
                         self.chat_items.append(Rule(style="dim"))
                     self.chat_items.append(f"[{self.colors['grad_start']}]>[/] {queued_cmd}")
                     current_prompt = queued_cmd
+        last_reply = next((str(m.get("content", "")) for m in reversed(self.messages) if m.get("role") == "assistant" and m.get("content")), "")
+        self._notify_turn_finished(time.monotonic() - turn_t0, last_reply)
 
 
     def _ui_render_split_frame(
@@ -5659,7 +6943,12 @@ class LocalAICLI:
                 pane_inner_w = max(16, calc_left_w - (2 if box_type is None else 4))
 
             left_lines: List[Any] = []
+            self._last_split_hits = []
+            row_cursor_y = hdr_rows + (1 if box_type is None else 2)
+            pane_x_end = w if split_mode != "horizontal" else max(24, min(int(w * 0.65), int(w * ratio)))
             for idx in range(scroll, min(total, scroll + max_items)):
+                self._last_split_hits.append((row_cursor_y, row_cursor_y, 1, pane_x_end, idx))
+                row_cursor_y += 1
                 label, is_sel, badge = left_rows[idx]
                 badge_str = f"  [{badge}]" if badge else ""
                 avail_w = max(6, pane_inner_w - 2 - len(badge_str))
@@ -5907,7 +7196,7 @@ class LocalAICLI:
                 self.config.active_skills.append(name)
                 self.config.save()
 
-    
+
     def _prompt_in_pane_text(self, title: str, prompt_label: str, hint: str = "") -> Optional[str]:
         """Dedicated in-pane single-line input prompt on the left pane without breaking raw TUI."""
         buf = ""
@@ -6206,15 +7495,18 @@ class LocalAICLI:
                     right_blocks.append(f"     [dim]{st.instruction}[/]")
             elif sel["kind"] == "skill":
                 sname = sel["name"]
-                scontent = sel["obj"]
+                sk: SkillDef = sel["obj"]
                 is_on = sname in self.config.active_skills
                 right_blocks.append(
                     f"[bold {self.colors['grad_start']}]@{sname}[/]  "
                     f"[{'bold ' + self.colors['ok'] if is_on else 'dim'}][{'GLOBAL ACTIVE' if is_on else 'AVAILABLE'}][/]"
                 )
-                right_blocks.append(f"[dim]Injected into system prompt when toggled ON or referenced via @{sname}.[/]")
+                right_blocks.append(f"[dim]{sk.description}[/]")
+                right_blocks.append(f"[dim]Path: {sk.path} | Context: {sk.context_mode} | Slash: /{sname}[/]")
+                if sk.resources:
+                    right_blocks.append(f"[dim]Resources: {', '.join(sk.resources[:12])}[/]")
                 right_blocks.append(Rule(style="dim"))
-                right_blocks.append(Markdown(scontent))
+                right_blocks.append(Markdown(sk.body))
             else:
                 pslug = sel["name"]
                 pmeta = sel["obj"]
@@ -6263,6 +7555,19 @@ class LocalAICLI:
                     filter_q += key
                 continue
 
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                    if act and act.startswith("ROW:"):
+                        clicked_i = int(act.split(":")[1])
+                        if "idx" in locals():
+                            idx = clicked_i
+                        elif "view_idx" in locals():
+                            view_idx = clicked_i
+                continue
             if key == "LEFT":
                 self.switch_tab(-1)
             elif key == "RIGHT":
@@ -6466,6 +7771,136 @@ class LocalAICLI:
     # --------------------------------------------------------------------------
     # 8. ADVANCED TAB (Reasoning Traces, Context Budget & Active Prompt Inspector)
     # --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # 7B. MCP SERVERS TAB (OBSIDIAN, ROBLOX & CUSTOM STDIO MCP SERVERS)
+    # --------------------------------------------------------------------------
+    def run_mcp_tab(self) -> None:
+        idx = 0
+        status_msg = ""
+
+        while self.active_tab == "mcp":
+            servers = list(MCP_MANAGER.clients.values())
+            left_rows: List[Tuple[str, bool, str]] = []
+            if not servers:
+                left_rows.append(("(no MCP servers configured)", True, "EMPTY"))
+            else:
+                idx = idx % len(servers)
+                for i, srv in enumerate(servers):
+                    dot = "●" if srv.status == "ONLINE" else ("✕" if srv.status == "ERROR" else "○")
+                    badge = "ACTIVE" if srv.status == "ONLINE" else srv.status
+                    left_rows.append((f"{dot} {srv.raw_name}", i == idx, badge))
+
+            right_blocks: List[Any] = []
+            if servers:
+                cur = servers[idx]
+                st_color = (
+                    self.colors["ok"]
+                    if cur.status == "ONLINE"
+                    else (self.colors["err"] if cur.status == "ERROR" else "dim")
+                )
+                right_blocks.append(
+                    f"[bold {self.colors['grad_start']}]{cur.raw_name}[/]  "
+                    f"[bold {st_color}][{cur.status}][/]"
+                )
+                if cur.server_info:
+                    s_ver = cur.server_info.get("version", "")
+                    s_nm = cur.server_info.get("name", cur.raw_name)
+                    right_blocks.append(f"[dim]Server Info: {s_nm} {s_ver}[/]")
+                right_blocks.append(Rule(style="dim"))
+                right_blocks.append(f"[bold]Command:[/]    [dim]{cur.command} {' '.join(cur.args)}[/]")
+                right_blocks.append(f"[bold]Config:[/]     [dim]{cur.source_file or MCP_CONFIG_FILE}[/]")
+                allow_rule = f"mcp:{cur.name}" in self.config.always_allow
+                right_blocks.append(
+                    f"[bold]Approval:[/]   {'[green]Always Allowed[/]' if allow_rule else '[dim]Prompt on tool call (press a to whitelist)[/]'}"
+                )
+                if cur.error:
+                    right_blocks.append("")
+                    right_blocks.append(Panel(f"[{self.colors['err']}]{cur.error}[/]", title="Connection Error", box=ROUNDED, border_style=self.colors["err"]))
+                right_blocks.append("")
+                right_blocks.append(f"[bold {self.colors['accent']}]Discovered Tools ({len(cur.tools)})[/]")
+                if not cur.tools:
+                    if cur.status == "DISABLED":
+                        right_blocks.append("[dim]Server is disabled. Press Enter/Space to enable & connect, or 'e' to edit paths in mcp.json.[/]")
+                    else:
+                        right_blocks.append("[dim]No tools exposed by this server yet.[/]")
+                else:
+                    for t in cur.tools[:14]:
+                        tname = t.get("name", "")
+                        tdesc = str(t.get("description", "")).strip().splitlines()[0][:72]
+                        right_blocks.append(f"  • [bold]mcp_{cur.name}_{tname}[/] [dim]— {tdesc}[/]")
+                    if len(cur.tools) > 14:
+                        right_blocks.append(f"  [dim]... +{len(cur.tools) - 14} more tools[/]")
+            else:
+                right_blocks.append(f"[bold {self.colors['grad_start']}]Model Context Protocol (MCP)[/]")
+                right_blocks.append(Rule(style="dim"))
+                right_blocks.append(f"Edit [bold]{MCP_CONFIG_FILE}[/] (press [bold]e[/]) to configure Obsidian, Roblox, or any stdio MCP server.")
+
+            if MCP_MANAGER.load_errors:
+                right_blocks.append("")
+                right_blocks.append(f"[{self.colors['err']}]Config errors: {'; '.join(MCP_MANAGER.load_errors)}[/]")
+
+            online_cnt = sum(1 for s in servers if s.status == "ONLINE")
+            total_tools = len(MCP_MANAGER.tool_definitions())
+            self._ui_render_split_frame(
+                "MCP SERVERS (OBSIDIAN / ROBLOX)",
+                f"{online_cnt}/{len(servers)} online · {total_tools} tools active",
+                left_rows,
+                right_blocks,
+                [("↑/↓", "nav"), ("Enter/Space", "toggle"), ("r", "reconnect"), ("e", "edit mcp.json"), ("a", "always-allow"), ("←/→", "tabs")],
+                status_banner=status_msg,
+            )
+            status_msg = ""
+
+            key = read_key()
+            if key == "RESIZE":
+                continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                    if act and act.startswith("ROW:"):
+                        clicked_i = int(act.split(":")[1])
+                        if "idx" in locals():
+                            idx = clicked_i
+                        elif "view_idx" in locals():
+                            view_idx = clicked_i
+                continue
+            if key == "LEFT":
+                self.switch_tab(-1)
+            elif key == "RIGHT":
+                self.switch_tab(1)
+            elif key == "UP" and servers:
+                idx = (idx - 1) % len(servers)
+            elif key == "DOWN" and servers:
+                idx = (idx + 1) % len(servers)
+            elif key in ("ENTER", " ") and servers:
+                status_msg = MCP_MANAGER.toggle_server(servers[idx].name)
+            elif key in ("r", "R"):
+                MCP_MANAGER.reload()
+                status_msg = "Reconnected MCP servers"
+            elif key in ("e", "E"):
+                cfg_target = Path(servers[idx].source_file) if (servers and servers[idx].source_file) else MCP_CONFIG_FILE
+                edited = self.open_external_editor(cfg_target.read_text() if cfg_target.is_file() else "{}")
+                if edited:
+                    try:
+                        json.loads(edited)
+                        _atomic_write_text(cfg_target, edited + "\n")
+                        MCP_MANAGER.reload()
+                        status_msg = f"Saved & reloaded {cfg_target.name}"
+                    except json.JSONDecodeError as je:
+                        status_msg = f"Invalid JSON (not saved): {je}"
+            elif key in ("a", "A") and servers:
+                akey = f"mcp:{servers[idx].name}"
+                if akey in self.config.always_allow:
+                    self.config.always_allow.remove(akey)
+                    status_msg = f"Removed always-allow for {akey}"
+                else:
+                    self.config.always_allow.append(akey)
+                    status_msg = f"Always-allowed all tools on {akey}"
+                self.config.save()
+
     def run_advanced_tab(self) -> None:
         view_idx = 0
         scroll = 0
@@ -6593,6 +8028,19 @@ class LocalAICLI:
             key = read_key()
             if key == "RESIZE":
                 continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                    if act and act.startswith("ROW:"):
+                        clicked_i = int(act.split(":")[1])
+                        if "idx" in locals():
+                            idx = clicked_i
+                        elif "view_idx" in locals():
+                            view_idx = clicked_i
+                continue
             if key == "LEFT":
                 self.switch_tab(-1)
             elif key == "RIGHT":
@@ -6608,10 +8056,15 @@ class LocalAICLI:
                 scroll = 0
             elif key == "ENTER":
                 scroll = 0
+            elif key == "TAB":
+                view_idx = (view_idx + 1) % len(views)
+                scroll = 0
             elif key in ("j", "J", "PGDN", "WHEEL_DOWN"):
-                scroll += 1
+                scroll += 3 if key == "PGDN" else 1
             elif key in ("k", "K", "PGUP", "WHEEL_UP"):
-                scroll = max(0, scroll - 1)
+                scroll = max(0, scroll - (3 if key == "PGUP" else 1))
+            elif key == "g":
+                scroll = 0
             elif key in ("y", "Y") and self.thoughts:
                 ok, info = copy_to_clipboard(self.thoughts[-1])
                 status_msg = f"Copied latest thought via {info}" if ok else f"Copy failed: {info}"
@@ -6742,6 +8195,19 @@ class LocalAICLI:
                 continue
             if key == "RESIZE":
                 continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                    if act and act.startswith("ROW:"):
+                        clicked_i = int(act.split(":")[1])
+                        if "idx" in locals():
+                            idx = clicked_i
+                        elif "view_idx" in locals():
+                            view_idx = clicked_i
+                continue
             if key == "LEFT":
                 self.switch_tab(-1)
             elif key == "RIGHT":
@@ -6756,6 +8222,26 @@ class LocalAICLI:
                 idx = max(0, idx - 1)
             elif key == "DOWN":
                 idx += 1
+            elif key in ("f", "F") and mode == "sessions" and sessions_data:
+                chosen = sessions_data[idx % len(sessions_data)]
+                self.session_id = chosen.get("id", self.session_id)
+                self.messages = list(chosen.get("messages", []))
+                nid = self.fork_current_session()
+                status_msg = f"Forked into {self.session_name} ({nid})"
+            elif key in ("n", "N") and mode == "sessions":
+                self.save_session()
+                self.messages.clear()
+                self.chat_items.clear()
+                self.session_id = datetime.now().strftime("session-%Y%m%d-%H%M%S")
+                self.session_name = "session"
+                self.active_tab = "prompt"
+                return
+            elif key in ("d", "D") and mode == "sessions" and sessions_data:
+                chosen = sessions_data[idx % len(sessions_data)]
+                p_del = chosen.get("_path")
+                if isinstance(p_del, Path) and p_del.exists():
+                    p_del.unlink(missing_ok=True)
+                    status_msg = f"Deleted session {chosen.get('id', '')}"
             elif key in ("u", "U"):
                 self.rewind_checkpoint()
                 self.active_tab = "prompt"
@@ -6814,6 +8300,10 @@ class LocalAICLI:
                 {"key": "auto_approve", "label": "Auto-Approve File Edits", "val": "ON" if self.config.auto_approve else "OFF", "default": "OFF", "desc": "Skip confirmation prompts for edit_file/write_file (shell commands always prompt)."},
                 {"key": "auto_commit", "label": "Git Auto-Commit Edits", "val": "ON" if self.config.auto_commit else "OFF", "default": "OFF", "desc": "Automatically create a local git commit after each approved file edit."},
                 {"key": "auto_docs_skills", "label": "AI Docs & Skills Lookup", "val": "ON" if self.config.auto_docs_skills else "OFF", "default": "ON", "desc": "Allow the AI to check back at documentation and Skills/ on demand during tasks."},
+                {"key": "permission_mode", "label": "Permission Mode", "val": self.config.permission_mode.upper(), "default": "ASK", "desc": "Tool approval policy: ASK (prompt), AUTO-EDIT (auto file edits), or YOLO (auto all)."},
+                {"key": "notify_long_turns", "label": "Long-Turn Notifications", "val": "ON" if self.config.notify_long_turns else "OFF", "default": "OFF", "desc": "Manually enable terminal bell & desktop notifications when a turn exceeds the threshold."},
+                {"key": "notify_threshold_sec", "label": "Notification Threshold (s)", "val": f"{self.config.notify_threshold_sec}s", "default": "15s", "desc": "Seconds a turn must run before firing a long-turn notification."},
+                {"key": "mouse_support", "label": "Mouse Click Support", "val": "ON" if self.config.mouse_support else "OFF", "default": "ON", "desc": "Enable SGR/X10 mouse clicks on navigation tabs, split-pane lists, and menus."},
                 {"key": "temperature", "label": "Temperature", "val": str(self.config.temperature), "default": "0.2", "desc": "Sampling temperature (0.0 = deterministic coding, higher = more creative)."},
                 {"key": "num_ctx", "label": "Context Window (num_ctx)", "val": str(self.config.num_ctx), "default": "32768", "desc": "Context window size in tokens. Keep >= 32768 when reading multi-hundred-line files."},
                 {"key": "max_tokens", "label": "Max Output Tokens", "val": str(self.config.max_tokens), "default": "4096", "desc": "Maximum completion tokens per assistant turn."},
@@ -6853,6 +8343,19 @@ class LocalAICLI:
             key = read_key()
             if key == "RESIZE":
                 continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                    if act and act.startswith("ROW:"):
+                        clicked_i = int(act.split(":")[1])
+                        if "idx" in locals():
+                            idx = clicked_i
+                        elif "view_idx" in locals():
+                            view_idx = clicked_i
+                continue
             if key == "LEFT":
                 self.switch_tab(-1)
             elif key == "RIGHT":
@@ -6891,6 +8394,21 @@ class LocalAICLI:
                     self.config.auto_commit = not self.config.auto_commit
                 elif k == "auto_docs_skills":
                     self.config.auto_docs_skills = not self.config.auto_docs_skills
+                elif k == "permission_mode":
+                    modes = ["ask", "auto-edit", "yolo"]
+                    nxt = modes[(modes.index(self.config.permission_mode) + 1) % len(modes)] if self.config.permission_mode in modes else "ask"
+                    self.config.permission_mode = nxt
+                    self.config.auto_approve = nxt in ("auto-edit", "yolo")
+                elif k == "notify_long_turns":
+                    self.config.notify_long_turns = not self.config.notify_long_turns
+                elif k == "notify_threshold_sec":
+                    val = self._prompt_line_field("Notification Threshold (seconds)", str(self.config.notify_threshold_sec))
+                    try:
+                        self.config.notify_threshold_sec = max(1, int(val))
+                    except ValueError:
+                        pass
+                elif k == "mouse_support":
+                    self.config.mouse_support = not self.config.mouse_support
                 elif k == "temperature":
                     val = self._prompt_line_field("Temperature (0.0 - 2.0)", str(self.config.temperature))
                     try:
@@ -6973,6 +8491,19 @@ class LocalAICLI:
             key = read_key()
             if key == "RESIZE":
                 continue
+            if key.startswith("MOUSE_CLICK:"):
+                parts_m = key.split(":")
+                if len(parts_m) == 4 and parts_m[1] == "0":
+                    act = self._handle_global_mouse_click(int(parts_m[2]), int(parts_m[3]))
+                    if act and act.startswith("TAB:"):
+                        return
+                    if act and act.startswith("ROW:"):
+                        clicked_i = int(act.split(":")[1])
+                        if "idx" in locals():
+                            idx = clicked_i
+                        elif "view_idx" in locals():
+                            view_idx = clicked_i
+                continue
             if key == "LEFT":
                 self.switch_tab(-1)
             elif key == "RIGHT":
@@ -7051,6 +8582,8 @@ class LocalAICLI:
                     self.run_prompt_tab()
                 elif self.active_tab == "agents":
                     self.run_agents_tab()
+                elif self.active_tab == "mcp":
+                    self.run_mcp_tab()
                 elif self.active_tab == "advanced":
                     self.run_advanced_tab()
                 elif self.active_tab == "history":
